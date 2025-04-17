@@ -1,0 +1,43 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+crypto_trader.log
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Google API credentials
+credentials.json
+*-credentials.json
+client_secret*.json
+token.json
+
+# Data files
+*.csv
+Investment*tracker*
+
+# Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
