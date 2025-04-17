@@ -33,7 +33,7 @@ class CryptoExchangeAPI:
     def __init__(self, api_key=None, api_secret=None, api_url=None):
         self.api_key = api_key or os.getenv('CRYPTO_API_KEY')
         self.api_secret = api_secret or os.getenv('CRYPTO_API_SECRET')
-        self.api_url = api_url or os.getenv('CRYPTO_API_URL', 'https://api.crypto.com/v2/')
+        self.api_url = api_url or os.getenv('CRYPTO_API_URL', 'https://uat-api.3ona.co/exchange/v1/')
         
         if not all([self.api_key, self.api_secret, self.api_url]):
             raise ValueError("API Key, Secret, and URL must be provided or set as environment variables")
@@ -44,61 +44,149 @@ class CryptoExchangeAPI:
             
         logger.info(f"CryptoExchangeAPI initialized with URL: {self.api_url}")
     
-    def _generate_signature(self, request_body):
+    def _params_to_str(self, params, level=0):
         """
-        Generate HMAC SHA256 signature for API authentication
-        """
-        # Request body should be a string
-        if isinstance(request_body, dict):
-            request_body = json.dumps(request_body)
+        Convert params object to string according to Crypto.com's algorithm
         
-        # Create signature
+        Args:
+            params (dict): Parameters object
+            level (int): Current nesting level
+            
+        Returns:
+            str: Stringified parameters
+        """
+        MAX_LEVEL = 3
+        
+        if level >= MAX_LEVEL:
+            return str(params)
+            
+        result = ""
+        # Sort keys alphabetically
+        for key in sorted(params.keys()):
+            result += key
+            if params[key] is None:
+                result += 'null'
+            elif isinstance(params[key], list):
+                for item in params[key]:
+                    if isinstance(item, dict):
+                        result += self._params_to_str(item, level + 1)
+                    else:
+                        result += str(item)
+            else:
+                result += str(params[key])
+                
+        return result
+    
+    def _generate_signature(self, method, request_id, params, nonce):
+        """
+        Generate HMAC SHA256 signature according to Crypto.com's algorithm
+        
+        Args:
+            method (str): API method
+            request_id (int): Request ID
+            params (dict): Request parameters
+            nonce (int): Nonce value
+            
+        Returns:
+            str: HMAC SHA256 signature in hex format
+        """
+        # Convert params to string if they exist
+        param_str = ""
+        if params:
+            param_str = self._params_to_str(params)
+            
+        # Construct payload: method + id + api_key + parameter_string + nonce
+        payload = method + str(request_id) + self.api_key + param_str + str(nonce)
+        
+        logger.debug(f"Signature payload: {payload}")
+        
+        # Generate HMAC-SHA256 signature
         signature = hmac.new(
             self.api_secret,
-            request_body.encode(),
+            payload.encode(),
             hashlib.sha256
         ).hexdigest()
         
+        logger.debug(f"Generated signature: {signature}")
         return signature
     
     def _get_nonce(self):
         """Get current timestamp in milliseconds for nonce"""
         return int(time.time() * 1000)
     
-    def make_request(self, method, endpoint, params=None):
+    def make_request(self, method, params=None):
         """
         Make an authenticated request to the Crypto.com Exchange API
-        """
-        url = f"{self.api_url}{endpoint}"
         
-        # Prepare request body
+        Args:
+            method (str): API method (e.g., 'private/get-account-summary')
+            params (dict, optional): Request parameters
+            
+        Returns:
+            dict: API response
+        """
+        # Fix URL construction
+        base_url = self.api_url
+        if not base_url.endswith('/'):
+            base_url += '/'
+        
+        # Construct URL properly without removing protocol double slashes
+        url = f"{base_url}{method}"
+        # Make sure we don't have double slashes in the path part (but keep protocol's double slash)
+        if '//' in url[8:]:  # Skip the protocol part
+            path_part = url[8:]
+            protocol_part = url[:8]
+            url = protocol_part + path_part.replace('//', '/')
+        
+        # Prepare request
         nonce = self._get_nonce()
+        request_id = nonce  # Using nonce as request ID
+        
+        # Ensure all numeric values in params are strings
+        if params:
+            self._stringify_numeric_values(params)
+        
         request_body = {
-            "id": nonce,
+            "id": request_id,
             "method": method,
             "api_key": self.api_key,
-            "nonce": nonce,
+            "nonce": nonce
         }
         
         # Add params if provided
         if params:
             request_body["params"] = params
         
-        # Convert to JSON string for signature
-        request_body_str = json.dumps(request_body, separators=(',', ':'))
-        
         # Generate signature
-        sig = self._generate_signature(request_body_str)
+        signature = self._generate_signature(method, request_id, params, nonce)
+        request_body["sig"] = signature
         
-        # Add signature to request
-        request_body["sig"] = sig
+        # Log request details for debugging (masking sensitive information)
+        safe_body = request_body.copy()
+        if 'api_key' in safe_body:
+            safe_body['api_key'] = safe_body['api_key'][:5] + '...'
+        if 'sig' in safe_body:
+            safe_body['sig'] = safe_body['sig'][:5] + '...'
+        logger.debug(f"Making request to {url} with body: {safe_body}")
         
-        logger.debug(f"Making request to {url} with body: {request_body_str}")
+        headers = {
+            'Content-Type': 'application/json'
+        }
         
         # Make the POST request
         try:
-            response = requests.post(url, json=request_body)
-            response_data = response.json()
+            response = requests.post(url, json=request_body, headers=headers)
+            
+            # Log response status and headers for debugging
+            logger.debug(f"Response status: {response.status_code}")
+            logger.debug(f"Response headers: {response.headers}")
+            
+            # Try to parse as JSON, but handle non-JSON responses
+            try:
+                response_data = response.json()
+            except json.JSONDecodeError:
+                logger.error(f"Non-JSON response: {response.text}")
+                return {"error": "Invalid JSON response", "status_code": response.status_code, "text": response.text}
             
             # Log response
             if response.status_code != 200 or (response_data.get('code') and response_data.get('code') != 0):
@@ -111,17 +199,45 @@ class CryptoExchangeAPI:
             logger.error(f"Request error: {str(e)}")
             return {"error": str(e)}
     
+    def _stringify_numeric_values(self, obj):
+        """
+        Convert numeric values to strings in a nested dictionary/list
+        
+        Args:
+            obj (dict/list): Object to process
+            
+        Note:
+            This modifies the object in-place
+        """
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, (int, float)):
+                    obj[key] = str(value)
+                elif isinstance(value, (dict, list)):
+                    self._stringify_numeric_values(value)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                if isinstance(item, (int, float)):
+                    obj[i] = str(item)
+                elif isinstance(item, (dict, list)):
+                    self._stringify_numeric_values(item)
+    
     def get_account_summary(self):
         """
         Get account balances and summary
         """
-        return self.make_request("private/get-account-summary", "")
+        # Use the real Crypto.com API endpoint
+        return self.make_request("private/get-account-summary")
     
     def get_balance(self, currency="USDT"):
         """
         Get specific currency balance
         """
-        account_summary = self.get_account_summary()
+        # The real API doesn't use params for get-account-summary
+        account_summary = self.make_request("private/get-account-summary")
+        
+        # Log the full response for debugging
+        logger.debug(f"Full balance response: {account_summary}")
         
         if "result" in account_summary and "accounts" in account_summary["result"]:
             for account in account_summary["result"]["accounts"]:
@@ -136,7 +252,8 @@ class CryptoExchangeAPI:
         Get current price for a trading pair
         """
         params = {"instrument_name": symbol}
-        response = self.make_request("public/get-ticker", "", params)
+        # Use the real Crypto.com API endpoint
+        response = self.make_request("public/get-ticker", params=params)
         
         if "result" in response and "data" in response["result"]:
             for ticker in response["result"]["data"]:
@@ -177,16 +294,20 @@ class CryptoExchangeAPI:
         if type_order == "LIMIT" and price is not None:
             params["price"] = str(price)
         
-        return self.make_request("private/create-order", "", params)
+        # Use the real Crypto.com API endpoint
+        return self.make_request("private/create-order", params=params)
 
 class GoogleSheetIntegration:
     """
     Handles interactions with Google Sheets
     """
-    def __init__(self, credentials_file=None, sheet_name=None):
+    def __init__(self, credentials_file=None, sheet_id=None):
         self.credentials_file = credentials_file or os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
-        self.sheet_name = sheet_name or os.getenv('GOOGLE_SHEET_NAME')
+        self.sheet_id = sheet_id or os.getenv('GOOGLE_SHEET_ID')
         
+        if not self.sheet_id:
+            raise ValueError("Google Sheet ID must be provided or set as GOOGLE_SHEET_ID in environment variables")
+            
         # Define the scope
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         
@@ -194,8 +315,10 @@ class GoogleSheetIntegration:
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name(self.credentials_file, scope)
             self.client = gspread.authorize(creds)
-            self.sheet = self.client.open(self.sheet_name).sheet1  # Assuming working with first sheet
-            logger.info(f"Connected to Google Sheet: {self.sheet_name}")
+            
+            # Open by sheet ID instead of name
+            self.sheet = self.client.open_by_key(self.sheet_id).sheet1  # Assuming working with first sheet
+            logger.info(f"Connected to Google Sheet with ID: {self.sheet_id}")
         except Exception as e:
             logger.error(f"Google Sheets authentication error: {str(e)}")
             raise
@@ -210,6 +333,11 @@ class GoogleSheetIntegration:
         try:
             # Get all data
             data = self.sheet.get_all_records()
+            
+            # Log first row for debugging
+            if data and len(data) > 0:
+                logger.debug(f"First row of sheet data: {data[0]}")
+                logger.debug(f"Column names: {list(data[0].keys())}")
             
             # Filter for signals where TRADE is "YES" and Buy Signal is not "WAIT"
             signals = []
@@ -427,15 +555,38 @@ class TradingBot:
             while True:
                 logger.info("Running trading cycle")
                 
-                # Test authentication
-                account = self.api.get_account_summary()
-                if "code" in account and account["code"] != 0:
-                    logger.error(f"Authentication failed: {account}")
+                # Test authentication with public endpoints first
+                logger.info("Testing public API endpoints...")
+                try:
+                    ticker_test = self.api.get_ticker("BTC_USDT")
+                    if not ticker_test:
+                        logger.warning("Public API test did not return data, but may still be functioning correctly.")
+                    else:
+                        logger.info(f"Public API test successful. BTC price: {ticker_test.get('price', 'unknown')}")
+                except Exception as e:
+                    logger.error(f"Public API test failed: {str(e)}")
+                
+                # Then test private endpoints
+                logger.info("Testing private API endpoints...")
+                try:
+                    account = self.api.get_account_summary()
+                    if "code" in account and account["code"] != 0:
+                        logger.error(f"Authentication failed: {account}")
+                        logger.info("Waiting before retry...")
+                        time.sleep(interval)
+                        continue
+                    logger.info("Private API authentication successful")
+                except Exception as e:
+                    logger.error(f"Private API test failed: {str(e)}")
+                    logger.info("Waiting before retry...")
                     time.sleep(interval)
                     continue
                 
                 # Execute signals
-                self.execute_signals()
+                try:
+                    self.execute_signals()
+                except Exception as e:
+                    logger.error(f"Error executing signals: {str(e)}")
                 
                 logger.info(f"Cycle complete. Waiting {interval} seconds...")
                 time.sleep(interval)

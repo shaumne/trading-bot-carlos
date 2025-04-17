@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+test_api.py
+get_account_summary.py
+a.txt
 
 # Virtual environments
 venv/
