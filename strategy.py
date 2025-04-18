@@ -334,6 +334,11 @@ class GoogleSheetIntegration:
         current_time = time.time()
         force_refresh = False
         
+        # Her 30 saniyede bir zorla yenileme yap - yeni coinleri kaçırmamak için
+        if current_time - self._last_pairs_fetch_time > 30:
+            logger.info("30 seconds passed, forcing list refresh")
+            force_refresh = True
+        
         # Check if cache is still valid
         if (current_time - self._last_pairs_fetch_time < self._pairs_cache_duration and 
             self._trading_pairs_cache and not force_refresh):
@@ -360,44 +365,67 @@ class GoogleSheetIntegration:
                 logger.error("No data found in the sheet")
                 return []
             
+            # Log the raw sheet data for debugging
+            logger.info(f"Sheet data retrieved: {len(all_records)} rows")
+            logger.info(f"First row example: {all_records[0] if all_records else 'No data'}")
+            
             # Extract cryptocurrency symbols where TRADE is YES
             pairs = []
             current_symbols = set()
             
             for idx, row in enumerate(all_records):
-                if row.get('TRADE', '').upper() == 'YES':
-                    coin = row.get('Coin')
-                    if coin:
-                        # Format the coin symbol for Crypto.com (BTC_USDT format)
-                        if '_' not in coin and '/' not in coin and '-' not in coin:
-                            # Simple coin name like "BTC" - add "_USDT"
-                            formatted_symbol = f"{coin}_USDT"
-                        elif '/' in coin:
-                            # Format like "BTC/USDT" - replace / with _
-                            formatted_symbol = coin.replace('/', '_')
-                        elif '-' in coin:
-                            # Format like "BTC-USDT" - replace - with _
-                            formatted_symbol = coin.replace('-', '_')
-                        else:
-                            # Already in correct format (BTC_USDT)
-                            formatted_symbol = coin
-                        
-                        pairs.append({
-                            'symbol': formatted_symbol,
-                            'original_symbol': coin,
-                            'row_index': idx + 2  # +2 for header and 1-indexing
-                        })
-                        current_symbols.add(formatted_symbol)
+                # Hem TRADE hem de Coin alanlarını kontrol et
+                trade_value = row.get('TRADE', '')
+                if isinstance(trade_value, str):
+                    trade_value = trade_value.upper()
+                
+                # Hem 'YES' hem de 'Y' değerlerini kabul et
+                is_active = trade_value in ['YES', 'Y', 'TRUE', '1']
+                
+                coin = row.get('Coin', '')
+                
+                # Daha fazla debug log
+                if coin:
+                    logger.debug(f"Coin: {coin}, TRADE: {trade_value}, Active: {is_active}")
+                
+                if is_active and coin:
+                    # Format the coin symbol for Crypto.com (BTC_USDT format)
+                    if '_' not in coin and '/' not in coin and '-' not in coin:
+                        # Simple coin name like "BTC" - add "_USDT"
+                        formatted_symbol = f"{coin}_USDT"
+                    elif '/' in coin:
+                        # Format like "BTC/USDT" - replace / with _
+                        formatted_symbol = coin.replace('/', '_')
+                    elif '-' in coin:
+                        # Format like "BTC-USDT" - replace - with _
+                        formatted_symbol = coin.replace('-', '_')
+                    else:
+                        # Already in correct format (BTC_USDT)
+                        formatted_symbol = coin
+                    
+                    # Coin eklendiğini logla
+                    logger.debug(f"Active coin found: {coin} -> {formatted_symbol}, row: {idx+2}")
+                    
+                    pairs.append({
+                        'symbol': formatted_symbol,
+                        'original_symbol': coin,
+                        'row_index': idx + 2  # +2 for header and 1-indexing
+                    })
+                    current_symbols.add(formatted_symbol)
+            
+            # Coinlerin listesini debug için göster
+            logger.info(f"Active coins: {', '.join(current_symbols)}")
+            logger.info(f"Previous coin list: {', '.join(self._prev_symbol_set)}")
             
             # Check for new or removed coins
             if self._prev_symbol_set:
                 # Find new coins
                 new_coins = current_symbols - self._prev_symbol_set
                 if new_coins:
-                    # Yeni coinleri işaretle
+                    # Mark new coins
                     self._newly_added_coins.update(new_coins)
                     
-                    # Bu coinlerin değer önbelleğini temizle
+                    # Clear cache values for these coins
                     for pair in pairs:
                         if pair["symbol"] in new_coins:
                             row_index = pair["row_index"]
@@ -405,25 +433,54 @@ class GoogleSheetIntegration:
                                 del self._cell_values_cache[row_index]
                     
                     new_coins_str = ", ".join(new_coins)
-                    logger.info(f"🔔 New coins added to tracking: {new_coins_str}")
+                    logger.info(f"🔔 NEW COINS DETECTED: {new_coins_str}")
                     logger.info(f"Will force immediate data refresh for new coins: {new_coins_str}")
                     
-                    # Notify via Telegram if available
+                    # 3 different ways to try sending Telegram notifications
                     try:
+                        # Method 1: Using new instance
                         telegram = TelegramNotifier()
-                        message = f"🔔 *New Coins Added*\n\nThe following coins were added to tracking:\n{new_coins_str}"
+                        message = f"🔔 *NEW COINS ADDED*\n\nThe following coins were added to tracking:\n{new_coins_str}"
                         sent = telegram.send_message(message)
                         if sent:
-                            logger.info(f"Telegram notification sent for new coins: {new_coins_str}")
+                            logger.info(f"Telegram notification sent (Method 1): {new_coins_str}")
                         else:
-                            logger.warning(f"Failed to send Telegram notification for new coins")
+                            logger.warning(f"Telegram notification not sent (Method 1)")
+                            
+                            # Method 2: Direct HTTP call
+                            try:
+                                token = os.getenv("TELEGRAM_BOT_TOKEN")
+                                chat_id = os.getenv("TELEGRAM_CHAT_ID")
+                                if token and chat_id:
+                                    url = f"https://api.telegram.org/bot{token}/sendMessage"
+                                    data = {
+                                        "chat_id": chat_id,
+                                        "text": message,
+                                        "parse_mode": "Markdown"
+                                    }
+                                    response = requests.post(url, data=data)
+                                    if response.status_code == 200:
+                                        logger.info(f"Telegram notification sent (Method 2): {new_coins_str}")
+                                    else:
+                                        logger.warning(f"Telegram notification not sent (Method 2): {response.status_code} - {response.text}")
+                            except Exception as e2:
+                                logger.error(f"Method 2 error: {str(e2)}")
+                                
                     except Exception as e:
-                        logger.error(f"Failed to send Telegram notification about new coins: {str(e)}")
+                        logger.error(f"NEW COIN NOTIFICATION ERROR: {str(e)}")
+                        
+                        # Method 3: Write to environment
+                        try:
+                            with open("NEW_COINS_DETECTED.txt", "a") as f:
+                                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - NEW COINS: {new_coins_str}\n")
+                            logger.info("New coins written to file: NEW_COINS_DETECTED.txt")
+                        except Exception as e3:
+                            logger.error(f"Error writing to file: {str(e3)}")
                 
                 # Find removed coins
                 removed_coins = self._prev_symbol_set - current_symbols
                 if removed_coins:
-                    # Kaldırılan coinleri yeni eklenenlerden çıkar
+                    # Remove removed coins from newly added ones
                     self._newly_added_coins -= removed_coins
                     
                     removed_coins_str = ", ".join(removed_coins)
@@ -431,24 +488,33 @@ class GoogleSheetIntegration:
                     # Notify via Telegram if available
                     try:
                         telegram = TelegramNotifier()
-                        message = f"🔕 *Coins Removed*\n\nThe following coins were removed from tracking:\n{removed_coins_str}"
+                        message = f"🔕 *COINS REMOVED*\n\nThe following coins were removed from tracking:\n{removed_coins_str}"
                         sent = telegram.send_message(message)
                         if sent:
-                            logger.info(f"Telegram notification sent for removed coins: {removed_coins_str}")
+                            logger.info(f"Telegram notification sent (removed): {removed_coins_str}")
                         else:
-                            logger.warning(f"Failed to send Telegram notification for removed coins")
+                            logger.warning(f"Telegram notification not sent (removed)")
                     except Exception as e:
-                        logger.error(f"Failed to send Telegram notification about removed coins: {str(e)}")
+                        logger.error(f"COIN REMOVAL NOTIFICATION ERROR: {str(e)}")
             
             # Update previous symbol set for next comparison
+            old_set = self._prev_symbol_set.copy()
             self._prev_symbol_set = current_symbols
+            
+            # Değişimleri logla
+            if old_set != current_symbols:
+                logger.info(f"Coin listesi güncellendi: {len(old_set)} -> {len(current_symbols)}")
             
             # Update cache and timestamp
             self._trading_pairs_cache = pairs
             self._last_pairs_fetch_time = current_time
             self._consecutive_errors = 0  # Reset error counter on success
             
-            logger.info(f"Retrieved {len(pairs)} trading pairs from sheet, cache updated")
+            # Yeni eklenen coinler varsa bildir
+            if self._newly_added_coins:
+                logger.info(f"NEW COINS THAT NEED IMMEDIATE ANALYSIS: {', '.join(self._newly_added_coins)}")
+            
+            logger.info(f"{len(pairs)} trading pairs retrieved, cache updated")
             
             return pairs
             
@@ -1157,7 +1223,7 @@ class TradingBot:
         # Send the analysis to Telegram
         self.telegram.send_message(message)
         
-    def process_pair(self, pair_info):
+    def process_pair(self, pair):
         """Process a single trading pair - legacy method for compatibility"""
         return self.process_pair_and_get_analysis(pair)
     
@@ -1166,6 +1232,7 @@ class TradingBot:
         logger.info(f"Starting trading bot with {self.update_interval}s interval, price updates every {self.price_update_interval}s")
         logger.info(f"Trading pairs will be refreshed from sheet every 3 minutes with new coin detection")
         logger.info(f"Data value change detection enabled to minimize API calls")
+        logger.info(f"NEW COIN DETECTION ENHANCED - Will check every 30 seconds")
         
         try:
             # Send startup notification to Telegram
@@ -1187,11 +1254,31 @@ class TradingBot:
             # Last trades check time to avoid hitting rate limits
             last_pairs_log_time = 0
             
+            # Variable for special new coin check
+            last_coin_check_time = 0
+            
             while True:
                 start_time = time.time()
                 
                 # Check if it's time for daily summary
                 self.telegram.send_daily_summary(list(self.analyzed_pairs.values()))
+                
+                # Check for new coins every 30 seconds
+                current_time = time.time()
+                if current_time - last_coin_check_time >= 30:
+                    logger.info("30 seconds passed, checking for new coins")
+                    try:
+                        # Check sheet in a different way than normal
+                        pairs = self.sheets.get_trading_pairs()
+                        logger.info(f"New coin check completed, {len(pairs)} coins to process")
+                        
+                        # Report new coin status
+                        if hasattr(self.sheets, '_newly_added_coins') and self.sheets._newly_added_coins:
+                            new_coins = ', '.join(self.sheets._newly_added_coins)
+                            logger.info(f"⭐⭐⭐ NEW COINS WAITING FOR PROCESSING: {new_coins}")
+                        last_coin_check_time = current_time
+                    except Exception as e:
+                        logger.error(f"Error in new coin check: {str(e)}")
                 
                 # Force refresh trading pairs periodically to ensure we don't miss any updates
                 force_refresh = False
@@ -1240,6 +1327,32 @@ class TradingBot:
                 cycle_failed_updates = 0
                 cycle_saved_updates = 0
                 
+                # Process new coins first
+                if hasattr(self.sheets, '_newly_added_coins') and self.sheets._newly_added_coins:
+                    new_coin_pairs = [p for p in pairs if p["symbol"] in self.sheets._newly_added_coins]
+                    if new_coin_pairs:
+                        logger.info(f"⭐⭐⭐ PROCESSING NEW COINS FIRST: {len(new_coin_pairs)} coins")
+                        for pair in new_coin_pairs:
+                            try:
+                                symbol = pair["symbol"]
+                                logger.info(f"🔄 PROCESSING NEW COIN: {symbol}")
+                                # Analyze and update immediately
+                                analysis = self.process_pair_and_get_analysis(pair)
+                                if analysis:
+                                    # Remove processed new coin from the list
+                                    if symbol in self.sheets._newly_added_coins:
+                                        self.sheets._newly_added_coins.remove(symbol)
+                                        logger.info(f"✅ NEW COIN SUCCESSFULLY PROCESSED: {symbol}")
+                                    
+                                    # Send Telegram notification
+                                    self.send_initial_analysis(analysis, pair)
+                                    logger.info(f"✅ NEW COIN TELEGRAM NOTIFICATION SENT: {symbol}")
+                                else:
+                                    logger.warning(f"❌ FAILED TO ANALYZE NEW COIN: {symbol}")
+                            except Exception as e:
+                                logger.error(f"❌ ERROR PROCESSING NEW COIN: {symbol}: {str(e)}")
+                
+                # Normal processing loop - process all coins
                 # Process pairs in batches
                 for i in range(0, len(pairs), self.batch_size):
                     batch = pairs[i:i+self.batch_size]
