@@ -36,7 +36,7 @@ class CryptoExchangeAPI:
         self.api_key = os.getenv("CRYPTO_API_KEY")
         self.api_secret = os.getenv("CRYPTO_API_SECRET")
         self.api_url = os.getenv("CRYPTO_API_URL", "https://api.crypto.com/v2/")
-        self.trade_amount = float(os.getenv("TRADE_AMOUNT", "100"))  # Default trade amount in USDT
+        self.trade_amount = float(os.getenv("TRADE_AMOUNT", "10"))  # Default trade amount in USDT
         self.min_balance_required = self.trade_amount * 1.05  # 5% buffer for fees
         
         if not self.api_key or not self.api_secret:
@@ -495,7 +495,8 @@ class GoogleSheetTradeManager:
         self.credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
         self.worksheet_name = os.getenv("GOOGLE_WORKSHEET_NAME", "Trading")
         self.exchange_api = CryptoExchangeAPI()
-        self.check_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "300"))  # Default 5 minutes
+        self.check_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "5"))  # Default 5 seconds
+        self.batch_size = int(os.getenv("BATCH_SIZE", "5"))  # Process in batches
         self.active_positions = {}  # Track active positions
         
         # Connect to Google Sheets
@@ -527,11 +528,17 @@ class GoogleSheetTradeManager:
                 logger.error("No data found in the sheet")
                 return []
             
-            # Find rows with BUY signal
+            # Find rows with BUY or SELL signals in Action column
             trade_signals = []
             for idx, row in enumerate(all_records):
-                # Check for BUY signal in column E (index 4)
-                if row.get('Action', '').upper() == 'BUY':
+                # Check if TRADE is YES and there's an action signal
+                trade_value = row.get('TRADE', '').upper()
+                is_active = trade_value in ['YES', 'Y', 'TRUE', '1']
+                action = row.get('Action', '').upper()
+                tradable = row.get('Tradable', 'YES').upper() == 'YES'
+                
+                # Only process if the coin is tradable and has either BUY or SELL signal
+                if is_active and tradable and (action == 'BUY' or action == 'SELL'):
                     symbol = row.get('Coin', '')
                     if not symbol:
                         continue
@@ -555,7 +562,8 @@ class GoogleSheetTradeManager:
                         'row_index': idx + 2,  # +2 for header and 1-indexing
                         'take_profit': take_profit,
                         'stop_loss': stop_loss,
-                        'last_price': last_price
+                        'last_price': last_price,
+                        'action': action  # Add action to track BUY vs SELL
                     })
             
             logger.info(f"Found {len(trade_signals)} trade signals")
@@ -565,19 +573,56 @@ class GoogleSheetTradeManager:
             logger.error(f"Error getting trade signals: {str(e)}")
             return []
     
-    def update_trade_status(self, row_index, status, order_id=None):
+    def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None):
         """Update trade status in Google Sheet"""
         try:
-            # Update Trade Status (column J)
-            self.worksheet.update_cell(row_index, 10, status)
+            # Update Order Placed? (column H)
+            self.worksheet.update_cell(row_index, 8, status)
             
-            if order_id:
-                # Update Order ID (column K)
-                self.worksheet.update_cell(row_index, 11, order_id)
+            # Set Tradable to NO when order is placed (column AG - after column AF, position 33)
+            if status == "ORDER_PLACED":
+                self.worksheet.update_cell(row_index, 33, "NO")
+                
+                # Update timestamp (column I - Order Date)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.worksheet.update_cell(row_index, 9, timestamp)
+                
+                if purchase_price:
+                    # Update Purchase Price (column J)
+                    self.worksheet.update_cell(row_index, 10, str(purchase_price))
+                
+                if quantity:
+                    # Update Quantity (column K)
+                    self.worksheet.update_cell(row_index, 11, str(quantity))
+                    
+                if order_id:
+                    # Store the order ID in Notes (column Q)
+                    self.worksheet.update_cell(row_index, 17, f"Order ID: {order_id}")
             
-            # Update timestamp (column L)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.worksheet.update_cell(row_index, 12, timestamp)
+            # When position is sold
+            elif status == "SOLD":
+                # Update Sold? (column M)
+                self.worksheet.update_cell(row_index, 13, "YES")
+                
+                if sell_price:
+                    # Update Sell Price (column N)
+                    self.worksheet.update_cell(row_index, 14, str(sell_price))
+                
+                if quantity:
+                    # Update Sell Quantity (column O)
+                    self.worksheet.update_cell(row_index, 15, str(quantity))
+                
+                # Update Sold Date (column P)
+                sold_date = sell_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.worksheet.update_cell(row_index, 16, sold_date)
+                
+                # Set Tradable back to YES (column AG - after column AF, position 33)
+                self.worksheet.update_cell(row_index, 33, "YES")
+                
+                # Add note that position is closed
+                current_notes = self.worksheet.cell(row_index, 17).value
+                new_notes = f"{current_notes} | Position closed: {sold_date}"
+                self.worksheet.update_cell(row_index, 17, new_notes)
             
             logger.info(f"Updated trade status for row {row_index}: {status}")
             return True
@@ -591,73 +636,93 @@ class GoogleSheetTradeManager:
         row_index = trade_signal['row_index']
         take_profit = float(trade_signal['take_profit'])
         stop_loss = float(trade_signal['stop_loss'])
+        action = trade_signal['action']  # Get the action (BUY or SELL)
         
-        # Check if we have an active position for this symbol
-        if symbol in self.active_positions:
-            logger.warning(f"Already have an active position for {symbol}, skipping")
-            return False
-        
-        # Check if we have sufficient balance
-        if not self.exchange_api.has_sufficient_balance():
-            logger.error(f"Insufficient balance for trade {symbol}")
-            self.update_trade_status(row_index, "INSUFFICIENT_BALANCE")
-            return False
-        
-        try:
-            # Calculate quantity based on trade amount
-            trade_amount = self.exchange_api.trade_amount
-            price = float(trade_signal['last_price'])
-            quantity = trade_amount / price
-            
-            # Round quantity to appropriate decimal places
-            # This is a simplified approach - you may need to get symbol precision from the exchange
-            quantity = round(quantity, 4)
-            
-            logger.info(f"Placing order: BUY {quantity} {symbol} at {price}")
-            
-            # Create buy order
-            order_id = self.exchange_api.create_order(
-                instrument_name=symbol,
-                side="BUY",
-                price=price,
-                quantity=quantity,
-                stop_loss=stop_loss,
-                take_profit=take_profit
-            )
-            
-            if not order_id:
-                logger.error(f"Failed to create order for {symbol}")
-                self.update_trade_status(row_index, "ORDER_FAILED")
+        # For BUY signals
+        if action == "BUY":
+            # Check if we have an active position for this symbol
+            if symbol in self.active_positions:
+                logger.warning(f"Already have an active position for {symbol}, skipping buy")
                 return False
             
-            # Update trade status in sheet
-            self.update_trade_status(row_index, "ORDER_PLACED", order_id)
+            # Check if we have sufficient balance
+            if not self.exchange_api.has_sufficient_balance():
+                logger.error(f"Insufficient balance for trade {symbol}")
+                self.update_trade_status(row_index, "INSUFFICIENT_BALANCE")
+                return False
             
-            # Add to active positions
-            self.active_positions[symbol] = {
-                'order_id': order_id,
-                'row_index': row_index,
-                'quantity': quantity,
-                'price': price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'status': 'ORDER_PLACED'
-            }
+            try:
+                # Calculate quantity based on trade amount
+                trade_amount = self.exchange_api.trade_amount
+                price = float(trade_signal['last_price'])
+                quantity = trade_amount / price
+                
+                # Round quantity to appropriate decimal places
+                # This is a simplified approach - you may need to get symbol precision from the exchange
+                quantity = round(quantity, 4)
+                
+                logger.info(f"Placing order: BUY {quantity} {symbol} at {price}")
+                
+                # Create buy order
+                order_id = self.exchange_api.create_order(
+                    instrument_name=symbol,
+                    side="BUY",
+                    price=price,
+                    quantity=quantity,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                
+                if not order_id:
+                    logger.error(f"Failed to create buy order for {symbol}")
+                    self.update_trade_status(row_index, "ORDER_FAILED")
+                    return False
+                
+                # Update trade status in sheet
+                self.update_trade_status(row_index, "ORDER_PLACED", order_id, purchase_price=price, quantity=quantity)
+                
+                # Add to active positions
+                self.active_positions[symbol] = {
+                    'order_id': order_id,
+                    'row_index': row_index,
+                    'quantity': quantity,
+                    'price': price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'status': 'ORDER_PLACED'
+                }
+                
+                # Start monitoring thread for this order
+                monitor_thread = threading.Thread(
+                    target=self.monitor_position,
+                    args=(symbol, order_id),
+                    daemon=True
+                )
+                monitor_thread.start()
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error executing buy trade for {symbol}: {str(e)}")
+                self.update_trade_status(row_index, "ERROR")
+                return False
+        
+        # For SELL signals
+        elif action == "SELL":
+            # Check if we have an active position to sell
+            if symbol not in self.active_positions:
+                logger.warning(f"No active position found for {symbol}, cannot sell")
+                return False
+                
+            # Execute sell for the active position
+            position = self.active_positions[symbol]
+            price = float(trade_signal['last_price'])
+            quantity = position['quantity']
             
-            # Start monitoring thread for this order
-            monitor_thread = threading.Thread(
-                target=self.monitor_position,
-                args=(symbol, order_id),
-                daemon=True
-            )
-            monitor_thread.start()
+            logger.info(f"Placing order: SELL {quantity} {symbol} at {price}")
             
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error executing trade for {symbol}: {str(e)}")
-            self.update_trade_status(row_index, "ERROR")
-            return False
+            # Execute the sell
+            return self.execute_sell(symbol, price)
     
     def monitor_position(self, symbol, order_id):
         """Monitor a position for order fill and status updates"""
@@ -670,19 +735,35 @@ class GoogleSheetTradeManager:
                 if symbol in self.active_positions:
                     row_index = self.active_positions[symbol]['row_index']
                     self.update_trade_status(row_index, "ORDER_CANCELLED")
+                    # Reset Tradable to YES since order was cancelled (column AG - after column AF)
+                    self.worksheet.update_cell(row_index, 33, "YES")
                     del self.active_positions[symbol]
                 return
             
             # Order is filled, update position status
             if symbol in self.active_positions:
                 row_index = self.active_positions[symbol]['row_index']
+                purchase_price = self.active_positions[symbol]['price']
+                quantity = self.active_positions[symbol]['quantity']
+                
                 self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
-                self.update_trade_status(row_index, "POSITION_ACTIVE")
+                self.update_trade_status(
+                    row_index, 
+                    "POSITION_ACTIVE",
+                    purchase_price=purchase_price,
+                    quantity=quantity
+                )
                 
                 # Continue monitoring the active position
                 while symbol in self.active_positions and self.active_positions[symbol]['status'] == 'POSITION_ACTIVE':
-                    # Here you would check if stop loss or take profit conditions are met
-                    # This would involve getting the current price and comparing to thresholds
+                    # Check for sell conditions (this is where you'd implement your exit strategy)
+                    # For now, this is a placeholder for your actual exit logic
+                    
+                    # Placeholder for sell logic - you can replace this with your actual conditions
+                    # such as checking if price has reached take profit or stop loss levels
+                    
+                    # If sell conditions met, execute sell
+                    # self.execute_sell(symbol)
                     
                     # For now, we'll just sleep
                     time.sleep(self.check_interval)
@@ -692,10 +773,65 @@ class GoogleSheetTradeManager:
             if symbol in self.active_positions:
                 row_index = self.active_positions[symbol]['row_index']
                 self.update_trade_status(row_index, "MONITOR_ERROR")
+                
+    def execute_sell(self, symbol, price=None):
+        """Execute a sell order for an active position"""
+        if symbol not in self.active_positions:
+            logger.warning(f"No active position found for {symbol}")
+            return False
+            
+        position = self.active_positions[symbol]
+        row_index = position['row_index']
+        quantity = position['quantity']
+        
+        try:
+            # If price is not provided, get current market price
+            if not price:
+                # You would need to implement a method to get current price
+                # price = self.get_current_price(symbol)
+                price = position['price'] * 1.05  # Placeholder: 5% profit
+                
+            logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price}")
+            
+            # Create sell order
+            order_id = self.exchange_api.create_order(
+                instrument_name=symbol,
+                side="SELL",
+                price=price,
+                quantity=quantity
+            )
+            
+            if not order_id:
+                logger.error(f"Failed to create sell order for {symbol}")
+                return False
+                
+            # Monitor the sell order
+            order_filled = self.exchange_api.monitor_order(order_id)
+            
+            if order_filled:
+                # Update sheet with sell information
+                self.update_trade_status(
+                    row_index,
+                    "SOLD",
+                    sell_price=price,
+                    quantity=quantity
+                )
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
+                return True
+            else:
+                logger.warning(f"Sell order {order_id} for {symbol} was not filled")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error executing sell for {symbol}: {str(e)}")
+            return False
     
     def run(self):
         """Main method to run the trade manager"""
         logger.info("Starting Trade Manager")
+        logger.info(f"Will check for signals every {self.check_interval} seconds")
         
         try:
             while True:
@@ -703,17 +839,29 @@ class GoogleSheetTradeManager:
                 signals = self.get_trade_signals()
                 
                 for signal in signals:
-                    # Check if we already have a position for this symbol
                     symbol = signal['symbol']
-                    if symbol in self.active_positions:
-                        logger.debug(f"Skipping {symbol} - already have an active position")
-                        continue
+                    action = signal['action']
                     
-                    # Execute the trade
-                    self.execute_trade(signal)
+                    # For BUY signals, check if we already have a position
+                    if action == "BUY":
+                        if symbol in self.active_positions:
+                            logger.debug(f"Skipping BUY for {symbol} - already have an active position")
+                            continue
+                        
+                        # Execute the buy trade
+                        self.execute_trade(signal)
+                    
+                    # For SELL signals, check if we have a position to sell
+                    elif action == "SELL":
+                        if symbol not in self.active_positions:
+                            logger.debug(f"Skipping SELL for {symbol} - no active position")
+                            continue
+                            
+                        # Execute the sell trade
+                        self.execute_trade(signal)
                     
                     # Small delay between trades
-                    time.sleep(2)
+                    time.sleep(0.5)
                 
                 # Sleep until next check
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
