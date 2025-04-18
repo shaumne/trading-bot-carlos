@@ -486,6 +486,57 @@ class CryptoExchangeAPI:
         logger.warning(f"Monitoring timed out for order {order_id}")
         return False
 
+    def get_current_price(self, instrument_name):
+        """Get current price for a symbol from the API"""
+        try:
+            method = "public/get-ticker"
+            request_id = int(time.time() * 1000)
+            
+            # For public endpoints, no signature is needed
+            params = {
+                "instrument_name": instrument_name
+            }
+            
+            # Construct proper URL
+            if self.api_url.endswith('/'):
+                base = self.api_url[:-1]  # Remove trailing slash
+            else:
+                base = self.api_url
+                
+            # API endpoint URL
+            api_endpoint = f"{base}/{method}"
+            
+            logger.debug(f"Getting current price for {instrument_name}")
+            
+            # Send the request
+            response = requests.get(api_endpoint, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == 0:
+                    result = data.get("result", {})
+                    ticker_data = result.get("data", [])
+                    
+                    if ticker_data:
+                        # Get the latest price
+                        latest_price = float(ticker_data[0].get("a", 0))  # 'a' is the ask price
+                        
+                        logger.info(f"Current price for {instrument_name}: {latest_price}")
+                        return latest_price
+                    else:
+                        logger.warning(f"No ticker data found for {instrument_name}")
+                else:
+                    error_code = data.get("code")
+                    error_msg = data.get("message", data.get("msg", "Unknown error"))
+                    logger.error(f"API error: {error_code} - {error_msg}")
+            else:
+                logger.error(f"HTTP error: {response.status_code} - {response.text}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current price for {instrument_name}: {str(e)}")
+            return None
+
 
 class GoogleSheetTradeManager:
     """Class to manage trades based on Google Sheet data"""
@@ -557,30 +608,51 @@ class GoogleSheetTradeManager:
                 if buy_signal == 'BUY':
                     # Get additional data for trade - handle European number format (comma as decimal separator)
                     try:
-                        # Handle either format: 1,234.56 or 1.234,56
-                        last_price_str = str(row.get('Last Price', '0')).replace(',', '.')
-                        if not last_price_str or last_price_str.strip() == '':
-                            last_price_str = '0'
+                        # Get real-time price from API
+                        api_price = self.exchange_api.get_current_price(formatted_pair)
                         
-                        # For Take Profit and Stop Loss, if empty, calculate based on Last Price
-                        take_profit_str = str(row.get('Take Profit', '')).replace(',', '.')
-                        if not take_profit_str or take_profit_str.strip() == '':
-                            # Default take profit: 20% above last price
-                            take_profit = float(last_price_str) * 1.20
-                            logger.info(f"Empty Take Profit for {symbol}, using default: {take_profit}")
-                        else:
-                            take_profit = float(take_profit_str)
+                        # If API price is available, use it, otherwise fall back to sheet price
+                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not sheet_price_str or sheet_price_str.strip() == '':
+                            sheet_price_str = '0'
                             
-                        stop_loss_str = str(row.get('Stop Loss', '')).replace(',', '.')
-                        if not stop_loss_str or stop_loss_str.strip() == '':
-                            # Default stop loss: 10% below last price
-                            stop_loss = float(last_price_str) * 0.90
-                            logger.info(f"Empty Stop Loss for {symbol}, using default: {stop_loss}")
+                        if api_price is not None:
+                            last_price = api_price
+                            logger.info(f"Using real-time API price for {symbol}: {last_price}")
                         else:
-                            stop_loss = float(stop_loss_str)
+                            last_price = float(sheet_price_str)
+                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
                         
-                        # Convert last price to float after using it for calculations
-                        last_price = float(last_price_str)
+                        # Get Resistance Up and Resistance Down values
+                        resistance_up_str = str(row.get('Resistance Up', '0')).replace(',', '.')
+                        resistance_down_str = str(row.get('Resistance Down', '0')).replace(',', '.')
+                        
+                        if not resistance_up_str or resistance_up_str.strip() == '':
+                            resistance_up_str = '0'
+                        if not resistance_down_str or resistance_down_str.strip() == '':
+                            resistance_down_str = '0'
+                            
+                        # Convert to float
+                        resistance_up = float(resistance_up_str)
+                        resistance_down = float(resistance_down_str)
+                        
+                        # Always calculate Take Profit as 5% below Resistance Up
+                        # If resistance up is zero or invalid, use 20% above last price
+                        if resistance_up > 0:
+                            take_profit = resistance_up * 0.95
+                            logger.info(f"Calculated Take Profit for {symbol} based on Resistance Up: {take_profit}")
+                        else:
+                            take_profit = last_price * 1.20
+                            logger.info(f"Invalid Resistance Up for {symbol}, using default Take Profit: {take_profit}")
+                            
+                        # Always calculate Stop Loss as 5% below Resistance Down (Support)
+                        # If resistance down is zero or invalid, use 10% below last price
+                        if resistance_down > 0:
+                            stop_loss = resistance_down * 0.95
+                            logger.info(f"Calculated Stop Loss for {symbol} based on Resistance Down: {stop_loss}")
+                        else:
+                            stop_loss = last_price * 0.90
+                            logger.info(f"Invalid Resistance Down for {symbol}, using default Stop Loss: {stop_loss}")
                         
                         # Get buy target if available (or use last price)
                         buy_target_str = str(row.get('Buy Target', '0')).replace(',', '.')
@@ -591,7 +663,8 @@ class GoogleSheetTradeManager:
                         
                         # Log parsed values for debugging
                         logger.debug(f"Parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
-                                    f"take_profit={take_profit}, stop_loss={stop_loss}")
+                                    f"take_profit={take_profit}, stop_loss={stop_loss}, " +
+                                    f"resistance_up={resistance_up}, resistance_down={resistance_down}")
                     except ValueError as e:
                         logger.error(f"Error parsing number values for {symbol}: {str(e)}")
                         continue
@@ -607,14 +680,23 @@ class GoogleSheetTradeManager:
                         'action': "BUY"
                     })
                 elif buy_signal == 'SELL':
-                    # For SELL signals, we just need the current price
+                    # For SELL signals, also get real-time price
                     try:
-                        last_price_str = str(row.get('Last Price', '0')).replace(',', '.')
-                        if not last_price_str or last_price_str.strip() == '':
-                            logger.warning(f"Empty Last Price for SELL signal {symbol}, skipping")
-                            continue
+                        # Get real-time price from API
+                        api_price = self.exchange_api.get_current_price(formatted_pair)
                         
-                        last_price = float(last_price_str)
+                        # If API price is available, use it, otherwise fall back to sheet price
+                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not sheet_price_str or sheet_price_str.strip() == '':
+                            sheet_price_str = '0'
+                            
+                        if api_price is not None:
+                            last_price = api_price
+                            logger.info(f"Using real-time API price for SELL signal {symbol}: {last_price}")
+                        else:
+                            last_price = float(sheet_price_str)
+                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
+                            
                         logger.debug(f"SELL signal for {symbol} at price {last_price}")
                     except ValueError as e:
                         logger.error(f"Error parsing price for SELL signal {symbol}: {str(e)}")
