@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 test_api.py
 get_account_summary.py
-a.txt
+*.txt
 
 # Virtual environments
 venv/
