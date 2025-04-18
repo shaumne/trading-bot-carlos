@@ -6,3 +6,4 @@ pandas
 numpy
 python-dateutil
 ntplibpython-telegram-bot
+tradingview_ta

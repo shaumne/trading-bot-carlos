@@ -553,15 +553,15 @@ class GoogleSheetIntegration:
                 "action": row_values[4] if len(row_values) > 4 else "",      # Column E
                 "take_profit": row_values[5] if len(row_values) > 5 else "",  # Column F
                 "stop_loss": row_values[6] if len(row_values) > 6 else "",    # Column G
-                "rsi": row_values[16] if len(row_values) > 16 else "",        # Column Q
-                "ma200": row_values[17] if len(row_values) > 17 else "",      # Column R
-                "ma200_valid": row_values[18] if len(row_values) > 18 else "", # Column S
-                "resistance": row_values[19] if len(row_values) > 19 else "",   # Column T
-                "support": row_values[20] if len(row_values) > 20 else "",      # Column U
+                "rsi": row_values[17] if len(row_values) > 17 else "",        # Column R
+                "ma200": row_values[18] if len(row_values) > 18 else "",      # Column S
+                "ma200_valid": row_values[19] if len(row_values) > 19 else "", # Column T
+                "resistance": row_values[20] if len(row_values) > 20 else "",   # Column U
+                "support": row_values[21] if len(row_values) > 21 else "",      # Column V
                 "timestamp": row_values[22] if len(row_values) > 22 else "",    # Column W
-                "ema10": row_values[24] if len(row_values) > 24 else "",        # Column Y
-                "ma50_valid": row_values[25] if len(row_values) > 25 else "",   # Column Z
-                "ema10_valid": row_values[26] if len(row_values) > 26 else ""   # Column AA
+                "ema10": row_values[26] if len(row_values) > 26 else "",        # Column AA
+                "ma50_valid": row_values[27] if len(row_values) > 27 else "",   # Column AB
+                "ema10_valid": row_values[28] if len(row_values) > 28 else ""   # Column AC
             }
             
             # Cache the values for future use
@@ -667,25 +667,25 @@ class GoogleSheetIntegration:
             cells_to_update = [
                 # Last Price (column C)
                 {"row": row_index, "col": 3, "value": data["last_price"]},
-                # RSI (column Q)
-                {"row": row_index, "col": 17, "value": data["rsi"]},
-                # MA200 (column R)
-                {"row": row_index, "col": 18, "value": data["ma200"]},
-                # MA200 Valid (column S)
-                {"row": row_index, "col": 19, "value": "YES" if data["ma200_valid"] else "NO"},
-                # Resistance Up (column T)
-                {"row": row_index, "col": 20, "value": data["resistance"]},
-                # Support (column U)
-                {"row": row_index, "col": 21, "value": data["support"]},
+                # RSI (column R)
+                {"row": row_index, "col": 18, "value": data["rsi"]},
+                # MA200 (column S)
+                {"row": row_index, "col": 19, "value": data["ma200"]},
+                # MA200 Valid (column T)
+                {"row": row_index, "col": 20, "value": "YES" if data["ma200_valid"] else "NO"},
+                # Resistance Up (column U)
+                {"row": row_index, "col": 21, "value": data["resistance"]},
+                # Resistance Down (column V)
+                {"row": row_index, "col": 22, "value": data["support"]},
                 # Last Updated (column W)
                 {"row": row_index, "col": 23, "value": data["timestamp"]},
-                # EMA10 (column Y)
-                {"row": row_index, "col": 25, "value": data["ema10"]},
-                # MA50 Valid (column Z)
-                {"row": row_index, "col": 26, "value": "YES" if data["ma50_valid"] else "NO"},
-                # EMA10 Valid (column AA)
-                {"row": row_index, "col": 27, "value": "YES" if data["ema10_valid"] else "NO"},
-                # Action (column E)
+                # EMA10 (column AA)
+                {"row": row_index, "col": 27, "value": data["ema10"]},
+                # MA50 Valid (column AB)
+                {"row": row_index, "col": 28, "value": "YES" if data["ma50_valid"] else "NO"},
+                # EMA10 Valid (column AC)
+                {"row": row_index, "col": 29, "value": "YES" if data["ema10_valid"] else "NO"},
+                # Buy Signal (column E)
                 {"row": row_index, "col": 5, "value": data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"])}
             ]
             
@@ -755,27 +755,27 @@ class GoogleSheetIntegration:
             # First batch: Update price and core indicators
             batch1 = [
                 self.worksheet.cell(row_index, 3, data["last_price"]),
-                self.worksheet.cell(row_index, 17, data["rsi"]),
-                self.worksheet.cell(row_index, 18, data["ma200"])
+                self.worksheet.cell(row_index, 18, data["rsi"]),
+                self.worksheet.cell(row_index, 19, data["ma200"])
             ]
             self.worksheet.update_cells(batch1)
             time.sleep(2)  # Wait between batches
             
             # Second batch: Update validations
             batch2 = [
-                self.worksheet.cell(row_index, 19, "YES" if data["ma200_valid"] else "NO"),
-                self.worksheet.cell(row_index, 26, "YES" if data["ma50_valid"] else "NO"),
-                self.worksheet.cell(row_index, 27, "YES" if data["ema10_valid"] else "NO")
+                self.worksheet.cell(row_index, 20, "YES" if data["ma200_valid"] else "NO"),
+                self.worksheet.cell(row_index, 28, "YES" if data["ma50_valid"] else "NO"),
+                self.worksheet.cell(row_index, 29, "YES" if data["ema10_valid"] else "NO")
             ]
             self.worksheet.update_cells(batch2)
             time.sleep(2)  # Wait between batches
             
             # Third batch: Update support/resistance and timestamps
             batch3 = [
-                self.worksheet.cell(row_index, 20, data["resistance"]),
-                self.worksheet.cell(row_index, 21, data["support"]),
+                self.worksheet.cell(row_index, 21, data["resistance"]),
+                self.worksheet.cell(row_index, 22, data["support"]),
                 self.worksheet.cell(row_index, 23, data["timestamp"]),
-                self.worksheet.cell(row_index, 25, data["ema10"])
+                self.worksheet.cell(row_index, 27, data["ema10"])
             ]
             self.worksheet.update_cells(batch3)
             time.sleep(2)  # Wait between batches

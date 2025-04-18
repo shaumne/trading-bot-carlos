@@ -528,33 +528,73 @@ class GoogleSheetTradeManager:
                 logger.error("No data found in the sheet")
                 return []
             
-            # Find rows with BUY or SELL signals in Action column
+            # Find rows with actionable signals in 'Buy Signal' column
             trade_signals = []
             for idx, row in enumerate(all_records):
-                # Check if TRADE is YES and there's an action signal
+                # Check if TRADE is YES
                 trade_value = row.get('TRADE', '').upper()
                 is_active = trade_value in ['YES', 'Y', 'TRUE', '1']
-                action = row.get('Action', '').upper()
+                buy_signal = row.get('Buy Signal', '').upper()
                 tradable = row.get('Tradable', 'YES').upper() == 'YES'
                 
-                # Only process if the coin is tradable and has either BUY or SELL signal
-                if is_active and tradable and (action == 'BUY' or action == 'SELL'):
-                    symbol = row.get('Coin', '')
-                    if not symbol:
-                        continue
-                        
-                    # Format for API: append _USDT if not already in pair format
-                    if '_' not in symbol and '/' not in symbol:
-                        formatted_pair = f"{symbol}_USDT"
-                    elif '/' in symbol:
-                        formatted_pair = symbol.replace('/', '_')
-                    else:
-                        formatted_pair = symbol
+                # Skip if not active or not tradable
+                if not is_active or not tradable:
+                    continue
+                
+                symbol = row.get('Coin', '')
+                if not symbol:
+                    continue
                     
-                    # Get additional data for trade
-                    take_profit = row.get('Take Profit', 0)
-                    stop_loss = row.get('Stop Loss', 0)
-                    last_price = row.get('Last Price', 0)
+                # Format for API: append _USDT if not already in pair format
+                if '_' not in symbol and '/' not in symbol:
+                    formatted_pair = f"{symbol}_USDT"
+                elif '/' in symbol:
+                    formatted_pair = symbol.replace('/', '_')
+                else:
+                    formatted_pair = symbol
+                
+                # Process based on signal type (BUY or SELL)
+                if buy_signal == 'BUY':
+                    # Get additional data for trade - handle European number format (comma as decimal separator)
+                    try:
+                        # Handle either format: 1,234.56 or 1.234,56
+                        last_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not last_price_str or last_price_str.strip() == '':
+                            last_price_str = '0'
+                        
+                        # For Take Profit and Stop Loss, if empty, calculate based on Last Price
+                        take_profit_str = str(row.get('Take Profit', '')).replace(',', '.')
+                        if not take_profit_str or take_profit_str.strip() == '':
+                            # Default take profit: 20% above last price
+                            take_profit = float(last_price_str) * 1.20
+                            logger.info(f"Empty Take Profit for {symbol}, using default: {take_profit}")
+                        else:
+                            take_profit = float(take_profit_str)
+                            
+                        stop_loss_str = str(row.get('Stop Loss', '')).replace(',', '.')
+                        if not stop_loss_str or stop_loss_str.strip() == '':
+                            # Default stop loss: 10% below last price
+                            stop_loss = float(last_price_str) * 0.90
+                            logger.info(f"Empty Stop Loss for {symbol}, using default: {stop_loss}")
+                        else:
+                            stop_loss = float(stop_loss_str)
+                        
+                        # Convert last price to float after using it for calculations
+                        last_price = float(last_price_str)
+                        
+                        # Get buy target if available (or use last price)
+                        buy_target_str = str(row.get('Buy Target', '0')).replace(',', '.')
+                        if not buy_target_str or buy_target_str.strip() == '':
+                            buy_target = last_price
+                        else:
+                            buy_target = float(buy_target_str)
+                        
+                        # Log parsed values for debugging
+                        logger.debug(f"Parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
+                                    f"take_profit={take_profit}, stop_loss={stop_loss}")
+                    except ValueError as e:
+                        logger.error(f"Error parsing number values for {symbol}: {str(e)}")
+                        continue
                     
                     trade_signals.append({
                         'symbol': formatted_pair,
@@ -563,7 +603,29 @@ class GoogleSheetTradeManager:
                         'take_profit': take_profit,
                         'stop_loss': stop_loss,
                         'last_price': last_price,
-                        'action': action  # Add action to track BUY vs SELL
+                        'buy_target': buy_target,
+                        'action': "BUY"
+                    })
+                elif buy_signal == 'SELL':
+                    # For SELL signals, we just need the current price
+                    try:
+                        last_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not last_price_str or last_price_str.strip() == '':
+                            logger.warning(f"Empty Last Price for SELL signal {symbol}, skipping")
+                            continue
+                        
+                        last_price = float(last_price_str)
+                        logger.debug(f"SELL signal for {symbol} at price {last_price}")
+                    except ValueError as e:
+                        logger.error(f"Error parsing price for SELL signal {symbol}: {str(e)}")
+                        continue
+                    
+                    trade_signals.append({
+                        'symbol': formatted_pair,
+                        'original_symbol': symbol,
+                        'row_index': idx + 2,
+                        'last_price': last_price,
+                        'action': "SELL"
                     })
             
             logger.info(f"Found {len(trade_signals)} trade signals")
@@ -634,12 +696,16 @@ class GoogleSheetTradeManager:
         """Execute a trade based on the signal"""
         symbol = trade_signal['symbol']
         row_index = trade_signal['row_index']
-        take_profit = float(trade_signal['take_profit'])
-        stop_loss = float(trade_signal['stop_loss'])
-        action = trade_signal['action']  # Get the action (BUY or SELL)
+        action = trade_signal['action']
         
-        # For BUY signals
+        # BUY signal processing
         if action == "BUY":
+            take_profit = float(trade_signal['take_profit'])
+            stop_loss = float(trade_signal['stop_loss'])
+            
+            # Always use Buy Target price if available, otherwise use Last Price
+            price = float(trade_signal.get('buy_target', trade_signal['last_price']))
+            
             # Check if we have an active position for this symbol
             if symbol in self.active_positions:
                 logger.warning(f"Already have an active position for {symbol}, skipping buy")
@@ -652,16 +718,32 @@ class GoogleSheetTradeManager:
                 return False
             
             try:
-                # Calculate quantity based on trade amount
+                # Calculate quantity based on trade amount and price
                 trade_amount = self.exchange_api.trade_amount
-                price = float(trade_signal['last_price'])
-                quantity = trade_amount / price
                 
-                # Round quantity to appropriate decimal places
-                # This is a simplified approach - you may need to get symbol precision from the exchange
-                quantity = round(quantity, 4)
+                # Calculate quantity - different precision for different price ranges
+                if price < 0.1:
+                    # For very low prices (e.g. BONK), use more decimal places
+                    quantity = round(trade_amount / price, 2)
+                elif price < 1:
+                    # For prices below $1, use 4 decimal places
+                    quantity = round(trade_amount / price, 4)
+                elif price < 10:
+                    # For prices below $10, use 3 decimal places
+                    quantity = round(trade_amount / price, 3)
+                elif price < 100:
+                    # For prices below $100, use 2 decimal places
+                    quantity = round(trade_amount / price, 2)
+                else:
+                    # For higher prices, use 1 decimal place
+                    quantity = round(trade_amount / price, 1)
+                    
+                # For very low-value coins like SHIB or BONK, need special handling
+                if price < 0.0001:
+                    # Just buy a large whole number instead of fractional amount
+                    quantity = int(trade_amount / price)
                 
-                logger.info(f"Placing order: BUY {quantity} {symbol} at {price}")
+                logger.info(f"Placing order: BUY {quantity} {symbol} at {price} with stop_loss={stop_loss} and take_profit={take_profit}")
                 
                 # Create buy order
                 order_id = self.exchange_api.create_order(
@@ -701,25 +783,25 @@ class GoogleSheetTradeManager:
                 monitor_thread.start()
                 
                 return True
-                
+                    
             except Exception as e:
                 logger.error(f"Error executing buy trade for {symbol}: {str(e)}")
                 self.update_trade_status(row_index, "ERROR")
                 return False
         
-        # For SELL signals
+        # SELL signal processing
         elif action == "SELL":
             # Check if we have an active position to sell
             if symbol not in self.active_positions:
                 logger.warning(f"No active position found for {symbol}, cannot sell")
                 return False
                 
-            # Execute sell for the active position
+            # Get current position details
             position = self.active_positions[symbol]
             price = float(trade_signal['last_price'])
             quantity = position['quantity']
             
-            logger.info(f"Placing order: SELL {quantity} {symbol} at {price}")
+            logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price} based on SELL signal")
             
             # Execute the sell
             return self.execute_sell(symbol, price)
@@ -838,12 +920,14 @@ class GoogleSheetTradeManager:
                 # Get and process trade signals
                 signals = self.get_trade_signals()
                 
+                # Process all signals (both BUY and SELL)
                 for signal in signals:
                     symbol = signal['symbol']
                     action = signal['action']
                     
-                    # For BUY signals, check if we already have a position
+                    # For BUY signals
                     if action == "BUY":
+                        # Skip if already have an active position
                         if symbol in self.active_positions:
                             logger.debug(f"Skipping BUY for {symbol} - already have an active position")
                             continue
@@ -851,17 +935,35 @@ class GoogleSheetTradeManager:
                         # Execute the buy trade
                         self.execute_trade(signal)
                     
-                    # For SELL signals, check if we have a position to sell
+                    # For SELL signals
                     elif action == "SELL":
+                        # Skip if no active position to sell
                         if symbol not in self.active_positions:
                             logger.debug(f"Skipping SELL for {symbol} - no active position")
                             continue
-                            
+                        
                         # Execute the sell trade
                         self.execute_trade(signal)
                     
                     # Small delay between trades
                     time.sleep(0.5)
+                
+                # Check for take profit/stop loss in active positions
+                for symbol in list(self.active_positions.keys()):
+                    position = self.active_positions[symbol]
+                    
+                    # Only check positions that are active (not pending orders)
+                    if position['status'] == 'POSITION_ACTIVE':
+                        # Check if take profit or stop loss conditions are met
+                        # This would typically involve getting the current price
+                        
+                        # For now, this is just a placeholder
+                        # In a real implementation, you would:
+                        # 1. Get current price
+                        # 2. Check if price >= take_profit or price <= stop_loss
+                        # 3. If so, execute_sell(symbol, price)
+                        
+                        pass
                 
                 # Sleep until next check
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
