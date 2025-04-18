@@ -11,7 +11,7 @@ import gspread
 import threading
 from queue import Queue
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -286,10 +286,72 @@ class GoogleSheetIntegration:
         except:
             self.worksheet = self.sheet.get_worksheet(0)
         
+        # Cache for trading pairs
+        self._trading_pairs_cache = []
+        self._last_pairs_fetch_time = 0
+        self._pairs_cache_duration = 180  # Cache trading pairs for 3 minutes (reduced from 5 minutes)
+        self._consecutive_errors = 0
+        self._max_retry_interval = 60  # Maximum backoff time in seconds
+        self._prev_symbol_set = set()  # Track coins for change detection
+        self._cell_values_cache = {}  # Cache current values to avoid unnecessary updates
+        self._newly_added_coins = set()  # Yeni eklenen coinleri takip etmek için set
+        
+        # Initialize with empty values
+        self._prev_symbol_set = self._get_current_symbols()
+        logger.info(f"Initial coin list created with {len(self._prev_symbol_set)} coins")
+        
         logger.info(f"Connected to Google Sheet: {self.sheet.title}")
     
+    def _get_current_symbols(self):
+        """Get current set of symbols from the sheet"""
+        try:
+            all_records = self.worksheet.get_all_records()
+            current_symbols = set()
+            
+            for row in all_records:
+                if row.get('TRADE', '').upper() == 'YES':
+                    coin = row.get('Coin')
+                    if coin:
+                        # Format symbol consistently
+                        if '_' not in coin and '/' not in coin and '-' not in coin:
+                            formatted_symbol = f"{coin}_USDT"
+                        elif '/' in coin:
+                            formatted_symbol = coin.replace('/', '_')
+                        elif '-' in coin:
+                            formatted_symbol = coin.replace('-', '_')
+                        else:
+                            formatted_symbol = coin
+                        
+                        current_symbols.add(formatted_symbol)
+            
+            return current_symbols
+        except Exception as e:
+            logger.error(f"Error getting initial symbols: {str(e)}")
+            return set()
+    
     def get_trading_pairs(self):
-        """Get list of trading pairs from sheet"""
+        """Get list of trading pairs from sheet with caching to prevent API rate limiting"""
+        current_time = time.time()
+        force_refresh = False
+        
+        # Check if cache is still valid
+        if (current_time - self._last_pairs_fetch_time < self._pairs_cache_duration and 
+            self._trading_pairs_cache and not force_refresh):
+            logger.debug(f"Using cached trading pairs (cache valid for {int(self._pairs_cache_duration - (current_time - self._last_pairs_fetch_time))}s more)")
+            return self._trading_pairs_cache
+        
+        # If we have consecutive errors, use exponential backoff
+        if self._consecutive_errors > 0:
+            retry_interval = min(2 ** self._consecutive_errors, self._max_retry_interval)
+            if current_time - self._last_pairs_fetch_time < retry_interval:
+                logger.warning(f"Using cached trading pairs due to previous API errors (retry in {int(retry_interval - (current_time - self._last_pairs_fetch_time))}s)")
+                if self._trading_pairs_cache:
+                    return self._trading_pairs_cache
+                else:
+                    # If no cache but we're in backoff, return empty list
+                    logger.error("No cached data available and in backoff period")
+                    return []
+        
         try:
             # Get all records in the sheet
             all_records = self.worksheet.get_all_records()
@@ -300,6 +362,8 @@ class GoogleSheetIntegration:
             
             # Extract cryptocurrency symbols where TRADE is YES
             pairs = []
+            current_symbols = set()
+            
             for idx, row in enumerate(all_records):
                 if row.get('TRADE', '').upper() == 'YES':
                     coin = row.get('Coin')
@@ -323,65 +387,348 @@ class GoogleSheetIntegration:
                             'original_symbol': coin,
                             'row_index': idx + 2  # +2 for header and 1-indexing
                         })
+                        current_symbols.add(formatted_symbol)
             
-            logger.info(f"Found {len(pairs)} trading pairs to track")
-            for pair in pairs:
-                logger.debug(f"Tracking: {pair['original_symbol']} (API format: {pair['symbol']}) - Row {pair['row_index']}")
+            # Check for new or removed coins
+            if self._prev_symbol_set:
+                # Find new coins
+                new_coins = current_symbols - self._prev_symbol_set
+                if new_coins:
+                    # Yeni coinleri işaretle
+                    self._newly_added_coins.update(new_coins)
+                    
+                    # Bu coinlerin değer önbelleğini temizle
+                    for pair in pairs:
+                        if pair["symbol"] in new_coins:
+                            row_index = pair["row_index"]
+                            if row_index in self._cell_values_cache:
+                                del self._cell_values_cache[row_index]
+                    
+                    new_coins_str = ", ".join(new_coins)
+                    logger.info(f"🔔 New coins added to tracking: {new_coins_str}")
+                    logger.info(f"Will force immediate data refresh for new coins: {new_coins_str}")
+                    
+                    # Notify via Telegram if available
+                    try:
+                        telegram = TelegramNotifier()
+                        message = f"🔔 *New Coins Added*\n\nThe following coins were added to tracking:\n{new_coins_str}"
+                        sent = telegram.send_message(message)
+                        if sent:
+                            logger.info(f"Telegram notification sent for new coins: {new_coins_str}")
+                        else:
+                            logger.warning(f"Failed to send Telegram notification for new coins")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification about new coins: {str(e)}")
+                
+                # Find removed coins
+                removed_coins = self._prev_symbol_set - current_symbols
+                if removed_coins:
+                    # Kaldırılan coinleri yeni eklenenlerden çıkar
+                    self._newly_added_coins -= removed_coins
+                    
+                    removed_coins_str = ", ".join(removed_coins)
+                    logger.info(f"🔕 Coins removed from tracking: {removed_coins_str}")
+                    # Notify via Telegram if available
+                    try:
+                        telegram = TelegramNotifier()
+                        message = f"🔕 *Coins Removed*\n\nThe following coins were removed from tracking:\n{removed_coins_str}"
+                        sent = telegram.send_message(message)
+                        if sent:
+                            logger.info(f"Telegram notification sent for removed coins: {removed_coins_str}")
+                        else:
+                            logger.warning(f"Failed to send Telegram notification for removed coins")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification about removed coins: {str(e)}")
+            
+            # Update previous symbol set for next comparison
+            self._prev_symbol_set = current_symbols
+            
+            # Update cache and timestamp
+            self._trading_pairs_cache = pairs
+            self._last_pairs_fetch_time = current_time
+            self._consecutive_errors = 0  # Reset error counter on success
+            
+            logger.info(f"Retrieved {len(pairs)} trading pairs from sheet, cache updated")
             
             return pairs
             
         except Exception as e:
+            # Increment error counter for exponential backoff
+            self._consecutive_errors += 1
+            backoff_time = min(2 ** self._consecutive_errors, self._max_retry_interval)
+            
             logger.error(f"Error getting trading pairs: {str(e)}")
+            logger.warning(f"Will retry in approximately {backoff_time}s (attempt #{self._consecutive_errors})")
+            
+            # Return cached data if available
+            if self._trading_pairs_cache:
+                logger.info(f"Using cached data with {len(self._trading_pairs_cache)} pairs")
+                return self._trading_pairs_cache
+            
             return []
     
-    def update_analysis(self, row_index, data):
-        """Update analysis data in the Google Sheet"""
+    def _get_current_cell_values(self, row_index):
+        """Get current values for a row to compare with new values"""
+        # Use cache if available to avoid API call
+        if row_index in self._cell_values_cache:
+            return self._cell_values_cache[row_index]
+        
         try:
-            # Update Last Price (column C)
-            self.worksheet.update_cell(row_index, 3, data["last_price"])
+            # Get all values from the row
+            row_values = self.worksheet.row_values(row_index)
             
-            # Update RSI (column Q)
-            self.worksheet.update_cell(row_index, 17, data["rsi"])
-            
-            # Update MA200 (column R)
-            self.worksheet.update_cell(row_index, 18, data["ma200"])
-            
-            # Update MA200 Valid (column S)
-            self.worksheet.update_cell(row_index, 19, "YES" if data["ma200_valid"] else "NO")
-            
-            # Update Resistance Up (column T)
-            self.worksheet.update_cell(row_index, 20, data["resistance"])
-            
-            # Update Resistance Down / Support (column U)
-            self.worksheet.update_cell(row_index, 21, data["support"])
-            
-            # Update Last Updated (column W)
-            self.worksheet.update_cell(row_index, 23, data["timestamp"])
-            
-            # Update EMA10 (column Y)
-            self.worksheet.update_cell(row_index, 25, data["ema10"])
-            
-            # Update MA50 Valid (column Z)
-            self.worksheet.update_cell(row_index, 26, "YES" if data["ma50_valid"] else "NO")
-            
-            # Update EMA10 Valid (column AA)
-            self.worksheet.update_cell(row_index, 27, "YES" if data["ema10_valid"] else "NO")
-            
-            # Update Buy Signal (column E)
-            if data["action"] == "BUY":
-                self.worksheet.update_cell(row_index, 5, "BUY")
+            # Map to our expected column indices (if row doesn't have enough values, return empty dict)
+            if len(row_values) < 27:  # We need at least up to column AA (27 columns)
+                return {}
                 
-                # Also update Take Profit and Stop Loss if it's a BUY
-                self.worksheet.update_cell(row_index, 6, data["take_profit"])  # Take Profit
-                self.worksheet.update_cell(row_index, 7, data["stop_loss"])    # Stop Loss
-            elif data["action"] == "WAIT":
-                self.worksheet.update_cell(row_index, 5, "WAIT")
+            # Map the values to our expected structure
+            values = {
+                "last_price": row_values[2] if len(row_values) > 2 else "",  # Column C
+                "action": row_values[4] if len(row_values) > 4 else "",      # Column E
+                "take_profit": row_values[5] if len(row_values) > 5 else "",  # Column F
+                "stop_loss": row_values[6] if len(row_values) > 6 else "",    # Column G
+                "rsi": row_values[16] if len(row_values) > 16 else "",        # Column Q
+                "ma200": row_values[17] if len(row_values) > 17 else "",      # Column R
+                "ma200_valid": row_values[18] if len(row_values) > 18 else "", # Column S
+                "resistance": row_values[19] if len(row_values) > 19 else "",   # Column T
+                "support": row_values[20] if len(row_values) > 20 else "",      # Column U
+                "timestamp": row_values[22] if len(row_values) > 22 else "",    # Column W
+                "ema10": row_values[24] if len(row_values) > 24 else "",        # Column Y
+                "ma50_valid": row_values[25] if len(row_values) > 25 else "",   # Column Z
+                "ema10_valid": row_values[26] if len(row_values) > 26 else ""   # Column AA
+            }
             
-            logger.info(f"Updated analysis for row {row_index}: {data['symbol']} - {data['action']}")
+            # Cache the values for future use
+            self._cell_values_cache[row_index] = values
+            return values
             
+        except Exception as e:
+            logger.error(f"Error getting current cell values for row {row_index}: {str(e)}")
+            return {}
+    
+    def _values_changed(self, row_index, data):
+        """Check if values have actually changed to avoid unnecessary updates"""
+        symbol = data.get("symbol", "")
+        
+        # Yeni eklenen bir coin ise, her zaman güncelle
+        if symbol in self._newly_added_coins:
+            logger.info(f"Force updating data for newly added coin: {symbol}")
             return True
+        
+        current_values = self._get_current_cell_values(row_index)
+        if not current_values:
+            logger.info(f"No current values found for row {row_index}, will update")
+            return True
+            
+        # Convert all values to strings for comparison
+        new_values = {
+            "last_price": str(data["last_price"]),
+            "action": data["action"],
+            "rsi": str(data["rsi"]),
+            "ma200": str(data["ma200"]),
+            "ma200_valid": "YES" if data["ma200_valid"] else "NO",
+            "resistance": str(data["resistance"]),
+            "support": str(data["support"]),
+            "timestamp": data["timestamp"],
+            "ema10": str(data["ema10"]),
+            "ma50_valid": "YES" if data["ma50_valid"] else "NO",
+            "ema10_valid": "YES" if data["ema10_valid"] else "NO"
+        }
+        
+        # Also check take profit and stop loss if action is BUY
+        if data["action"] == "BUY":
+            new_values["take_profit"] = str(data["take_profit"])
+            new_values["stop_loss"] = str(data["stop_loss"])
+        
+        # Check for differences - prioritize important fields
+        changes = []
+        
+        # First check if action changed - most important
+        if current_values.get("action", "") != new_values["action"]:
+            changes.append(f"action: {current_values.get('action', '')} -> {new_values['action']}")
+        
+        # Check price change - important for charts
+        try:
+            curr_price = float(current_values.get("last_price", "0").replace(',', '.'))
+            new_price = float(new_values["last_price"])
+            # If price change is more than 0.5%, consider it changed
+            if abs(curr_price - new_price) / max(curr_price, 1e-10) > 0.005:
+                changes.append(f"price: {curr_price} -> {new_price}")
+        except:
+            # If conversion fails, consider it changed
+            changes.append("price: conversion error")
+        
+        # Check RSI change - important for signals
+        try:
+            curr_rsi = float(current_values.get("rsi", "0").replace(',', '.'))
+            new_rsi = float(new_values["rsi"])
+            # If RSI change is more than 2 points, consider it changed
+            if abs(curr_rsi - new_rsi) > 2:
+                changes.append(f"RSI: {curr_rsi} -> {new_rsi}")
+        except:
+            # If conversion fails, consider it changed
+            changes.append("RSI: conversion error")
+            
+        # For other indicators, just check if they're different
+        if current_values.get("ma200_valid", "") != new_values["ma200_valid"]:
+            changes.append(f"MA200: {current_values.get('ma200_valid', '')} -> {new_values['ma200_valid']}")
+            
+        if current_values.get("ma50_valid", "") != new_values["ma50_valid"]:
+            changes.append(f"MA50: {current_values.get('ma50_valid', '')} -> {new_values['ma50_valid']}")
+            
+        if current_values.get("ema10_valid", "") != new_values["ema10_valid"]:
+            changes.append(f"EMA10: {current_values.get('ema10_valid', '')} -> {new_values['ema10_valid']}")
+        
+        # If there are any changes, update is needed
+        if changes:
+            logger.debug(f"Values changed for row {row_index}: {', '.join(changes)}")
+            return True
+            
+        logger.debug(f"No significant changes for row {row_index}, skipping update")
+        return False
+    
+    def update_analysis(self, row_index, data):
+        """Update analysis data in the Google Sheet using batch update"""
+        try:
+            symbol = data.get("symbol", "")
+            
+            # First check if values actually changed to avoid unnecessary updates
+            if not self._values_changed(row_index, data):
+                logger.info(f"No significant changes for {symbol}, skipping Google Sheets update")
+                return True  # Return true so the bot thinks update was successful
+            
+            # Prepare all cells to update
+            cells_to_update = [
+                # Last Price (column C)
+                {"row": row_index, "col": 3, "value": data["last_price"]},
+                # RSI (column Q)
+                {"row": row_index, "col": 17, "value": data["rsi"]},
+                # MA200 (column R)
+                {"row": row_index, "col": 18, "value": data["ma200"]},
+                # MA200 Valid (column S)
+                {"row": row_index, "col": 19, "value": "YES" if data["ma200_valid"] else "NO"},
+                # Resistance Up (column T)
+                {"row": row_index, "col": 20, "value": data["resistance"]},
+                # Support (column U)
+                {"row": row_index, "col": 21, "value": data["support"]},
+                # Last Updated (column W)
+                {"row": row_index, "col": 23, "value": data["timestamp"]},
+                # EMA10 (column Y)
+                {"row": row_index, "col": 25, "value": data["ema10"]},
+                # MA50 Valid (column Z)
+                {"row": row_index, "col": 26, "value": "YES" if data["ma50_valid"] else "NO"},
+                # EMA10 Valid (column AA)
+                {"row": row_index, "col": 27, "value": "YES" if data["ema10_valid"] else "NO"},
+                # Action (column E)
+                {"row": row_index, "col": 5, "value": data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"])}
+            ]
+            
+            # Add Take Profit and Stop Loss if it's a BUY
+            if data["action"] == "BUY":
+                cells_to_update.append({"row": row_index, "col": 6, "value": data["take_profit"]})  # Take Profit
+                cells_to_update.append({"row": row_index, "col": 7, "value": data["stop_loss"]})    # Stop Loss
+            
+            # Convert to Cell objects
+            cell_list = []
+            for cell_data in cells_to_update:
+                cell = self.worksheet.cell(cell_data["row"], cell_data["col"])
+                cell.value = cell_data["value"]
+                cell_list.append(cell)
+            
+            # Update all cells in a single batch request
+            self.worksheet.update_cells(cell_list, value_input_option='USER_ENTERED')
+            
+            # Update our cache with the new values
+            cache_values = {
+                "last_price": str(data["last_price"]),
+                "action": data["action"],
+                "rsi": str(data["rsi"]),
+                "ma200": str(data["ma200"]),
+                "ma200_valid": "YES" if data["ma200_valid"] else "NO",
+                "resistance": str(data["resistance"]),
+                "support": str(data["support"]),
+                "timestamp": data["timestamp"],
+                "ema10": str(data["ema10"]),
+                "ma50_valid": "YES" if data["ma50_valid"] else "NO",
+                "ema10_valid": "YES" if data["ema10_valid"] else "NO"
+            }
+            if data["action"] == "BUY":
+                cache_values["take_profit"] = str(data["take_profit"])
+                cache_values["stop_loss"] = str(data["stop_loss"])
+            
+            self._cell_values_cache[row_index] = cache_values
+            
+            # Başarılı güncelleme sonrası, yeni eklenen coinse, bu coini listeden çıkar
+            if symbol in self._newly_added_coins:
+                self._newly_added_coins.remove(symbol)
+                logger.info(f"Successfully updated newly added coin {symbol}, removing from new coins list")
+            
+            logger.info(f"Updated analysis for row {row_index}: {symbol} - {data['action']}")
+            return True
+            
         except Exception as e:
             logger.error(f"Error updating sheet: {str(e)}")
+            # If we hit rate limits, implement exponential backoff
+            if "Quota exceeded" in str(e):
+                logger.warning("Rate limit hit, will try again with exponential backoff")
+                try:
+                    # Wait for an increasing amount of time and retry
+                    for backoff in [5, 15, 30]:
+                        logger.info(f"Retrying update after {backoff} seconds...")
+                        time.sleep(backoff)
+                        # Try update with smaller batches
+                        self._update_with_smaller_batches(row_index, data)
+                        return True
+                except Exception as retry_error:
+                    logger.error(f"Retry failed: {str(retry_error)}")
+            return False
+    
+    def _update_with_smaller_batches(self, row_index, data):
+        """Update sheet using smaller batches to work around rate limits"""
+        try:
+            # First batch: Update price and core indicators
+            batch1 = [
+                self.worksheet.cell(row_index, 3, data["last_price"]),
+                self.worksheet.cell(row_index, 17, data["rsi"]),
+                self.worksheet.cell(row_index, 18, data["ma200"])
+            ]
+            self.worksheet.update_cells(batch1)
+            time.sleep(2)  # Wait between batches
+            
+            # Second batch: Update validations
+            batch2 = [
+                self.worksheet.cell(row_index, 19, "YES" if data["ma200_valid"] else "NO"),
+                self.worksheet.cell(row_index, 26, "YES" if data["ma50_valid"] else "NO"),
+                self.worksheet.cell(row_index, 27, "YES" if data["ema10_valid"] else "NO")
+            ]
+            self.worksheet.update_cells(batch2)
+            time.sleep(2)  # Wait between batches
+            
+            # Third batch: Update support/resistance and timestamps
+            batch3 = [
+                self.worksheet.cell(row_index, 20, data["resistance"]),
+                self.worksheet.cell(row_index, 21, data["support"]),
+                self.worksheet.cell(row_index, 23, data["timestamp"]),
+                self.worksheet.cell(row_index, 25, data["ema10"])
+            ]
+            self.worksheet.update_cells(batch3)
+            time.sleep(2)  # Wait between batches
+            
+            # Fourth batch: Update action and take profit/stop loss
+            batch4 = [
+                self.worksheet.cell(row_index, 5, data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"]))
+            ]
+            
+            if data["action"] == "BUY":
+                batch4.append(self.worksheet.cell(row_index, 6, data["take_profit"]))
+                batch4.append(self.worksheet.cell(row_index, 7, data["stop_loss"]))
+            
+            self.worksheet.update_cells(batch4)
+            
+            logger.info(f"Updated analysis for row {row_index} using smaller batches")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating with smaller batches: {str(e)}")
             return False
 
     def get_tracked_coins_count(self):
@@ -402,6 +749,7 @@ class TelegramNotifier:
         self.message_queue = Queue()
         self.message_sender_thread = None
         self.bot_initialized = False
+        self.last_daily_summary = None
         
         # Start message sender thread if credentials are available
         if self.token and self.chat_id:
@@ -517,8 +865,9 @@ class TelegramNotifier:
     
     def send_signal(self, data):
         """Format and send a trading signal message"""
-        if data["action"] == "WAIT":
-            return False  # Don't send wait signals
+        # Only send BUY signals as per requirements
+        if data["action"] != "BUY":
+            return False
         
         # Use original symbol name if available
         display_symbol = data.get("original_symbol", data["symbol"])
@@ -527,13 +876,12 @@ class TelegramNotifier:
         message += f"• Price: {data['last_price']:.8f}\n"
         message += f"• RSI: {data['rsi']:.2f}\n"
         
-        if data["action"] == "BUY":
-            message += f"• Take Profit: {data['take_profit']:.8f}\n"
-            message += f"• Stop Loss: {data['stop_loss']:.8f}\n"
-            message += f"\nTechnical Indicators:\n"
-            message += f"• MA200: {'YES' if data['ma200_valid'] else 'NO'}\n"
-            message += f"• MA50: {'YES' if data['ma50_valid'] else 'NO'}\n"
-            message += f"• EMA10: {'YES' if data['ema10_valid'] else 'NO'}\n"
+        message += f"• Take Profit: {data['take_profit']:.8f}\n"
+        message += f"• Stop Loss: {data['stop_loss']:.8f}\n"
+        message += f"\nTechnical Indicators:\n"
+        message += f"• MA200: {'YES' if data['ma200_valid'] else 'NO'}\n"
+        message += f"• MA50: {'YES' if data['ma50_valid'] else 'NO'}\n"
+        message += f"• EMA10: {'YES' if data['ema10_valid'] else 'NO'}\n"
         
         message += f"\nTimestamp: {data['timestamp']}"
         
@@ -542,14 +890,66 @@ class TelegramNotifier:
     def send_startup_message(self):
         """Send a message when the bot starts up"""
         coins = self.get_tracked_coins_count()
-        interval_mins = int(os.getenv("UPDATE_INTERVAL", "900")) // 60
+        update_interval = int(os.getenv("UPDATE_INTERVAL", "5"))
         
         message = f"*Crypto Trading Bot Started*\n\n"
         message += f"• Number of tracked coins: {coins}\n"
         message += f"• Analysis period: {os.getenv('TRADINGVIEW_INTERVAL', '1h')}\n"
-        message += f"• Update frequency: {interval_mins} minutes\n"
+        message += f"• Update frequency: {update_interval} seconds\n"
         message += f"• Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         message += f"Bot is now actively running! Signals will be sent automatically."
+        
+        return self.send_message(message)
+
+    def send_daily_summary(self, analyzed_pairs):
+        """Send a daily summary of all tracked coins"""
+        now = datetime.now()
+        
+        # Check if we already sent a summary today
+        if (self.last_daily_summary is not None and 
+            self.last_daily_summary.date() == now.date()):
+            return False
+        
+        # Update the last summary time
+        self.last_daily_summary = now
+        
+        # Create summary message starting with the date
+        message = f"*Daily Summary - {now.strftime('%Y-%m-%d')}*\n\n"
+        
+        # Group by action
+        buy_signals = []
+        watch_signals = []
+        other_signals = []
+        
+        for pair in analyzed_pairs:
+            if pair["action"] == "BUY":
+                buy_signals.append(pair)
+            elif pair["rsi"] < 45:  # Close to buy zone
+                watch_signals.append(pair)
+            else:
+                other_signals.append(pair)
+        
+        # Add BUY signals section
+        if buy_signals:
+            message += "🔥 *BUY Signals:*\n"
+            for signal in buy_signals:
+                symbol = signal.get("original_symbol", signal["symbol"])
+                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}\n"
+            message += "\n"
+        
+        # Add WATCH signals section
+        if watch_signals:
+            message += "👀 *Watch List:*\n"
+            for signal in watch_signals:
+                symbol = signal.get("original_symbol", signal["symbol"])
+                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}\n"
+            message += "\n"
+        
+        # Add summary statistic at the end
+        message += f"Total Coins Tracked: {len(analyzed_pairs)}\n"
+        message += f"BUY Signals: {len(buy_signals)}\n"
+        message += f"WATCH List: {len(watch_signals)}\n"
+        message += f"Others: {len(other_signals)}"
         
         return self.send_message(message)
     
@@ -568,9 +968,18 @@ class TradingBot:
     def __init__(self):
         self.data_provider = TradingViewDataProvider()
         self.sheets = GoogleSheetIntegration()
-        self.update_interval = int(os.getenv("UPDATE_INTERVAL", 60 * 15))  # Default 15 minutes
-        self.batch_size = int(os.getenv("BATCH_SIZE", 5))  # Process in batches
+        # Read update interval from .env file with default of 5 seconds
+        self.update_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "5"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "5"))  # Process in batches
         self.telegram = TelegramNotifier()
+        self.analyzed_pairs = {}  # Store the latest analysis for all pairs
+        self._previous_actions = {}  # Store previous actions for comparison
+        self._last_update_times = {}  # Store timestamps of last updates for each coin
+        self.price_update_interval = 15  # Force price updates every 15 seconds
+        self._failed_updates = {}  # Track failed updates per symbol
+        self._retry_delay = 60  # Retry failed coins after 60 seconds
+        self._force_sheet_refresh_interval = 600  # Force refresh trading pairs every 10 minutes
+        self._last_force_refresh = time.time()
     
     def process_pair_and_get_analysis(self, pair_info):
         """Process a single trading pair and return the analysis results"""
@@ -578,25 +987,118 @@ class TradingBot:
         original_symbol = pair_info.get("original_symbol", symbol)  # Original symbol from sheet
         row_index = pair_info["row_index"]
         
+        # Check if this symbol had recent failed updates
+        current_time = time.time()
+        if symbol in self._failed_updates:
+            last_fail_time, fail_count = self._failed_updates[symbol]
+            # If last failure was recent, skip for now
+            if current_time - last_fail_time < self._retry_delay:
+                logger.debug(f"Skipping {symbol} due to recent failure ({fail_count} fails), will retry in {int(self._retry_delay - (current_time - last_fail_time))}s")
+                return None
+        
         # Get TradingView analysis
-        analysis = self.data_provider.get_analysis(symbol)
-        
-        if not analysis:
-            logger.warning(f"No analysis data for {symbol}, skipping")
+        try:
+            analysis = self.data_provider.get_analysis(symbol)
+            
+            if not analysis:
+                logger.warning(f"No analysis data for {symbol}, skipping")
+                # Track this failure
+                if symbol in self._failed_updates:
+                    _, fail_count = self._failed_updates[symbol]
+                    self._failed_updates[symbol] = (current_time, fail_count + 1)
+                else:
+                    self._failed_updates[symbol] = (current_time, 1)
+                return None
+            
+            # Analysis successful, reset failure tracking if any
+            if symbol in self._failed_updates:
+                del self._failed_updates[symbol]
+                
+            # Add original symbol to the analysis data
+            if "original_symbol" not in analysis and original_symbol != symbol:
+                analysis["original_symbol"] = original_symbol
+            
+            # Store in analyzed pairs for daily summary
+            self.analyzed_pairs[symbol] = analysis
+            
+            # Determine whether to update the sheet based on conditions
+            should_update = False
+            
+            # Check if action has changed
+            prev_action = self._previous_actions.get(symbol)
+            action_changed = prev_action != analysis["action"]
+            
+            # Check when was the last update for this coin
+            last_update_time = self._last_update_times.get(symbol, 0)
+            time_since_last_update = current_time - last_update_time
+            
+            # For new coins (not in _last_update_times), always update
+            if symbol not in self._last_update_times:
+                should_update = True
+                logger.info(f"First update for new coin {symbol}")
+            # Update if:
+            # 1. The trading signal (action) has changed, OR
+            # 2. It's been at least price_update_interval seconds since the last update
+            elif action_changed or time_since_last_update >= self.price_update_interval:
+                should_update = True
+                
+                if action_changed:
+                    logger.info(f"Signal changed for {symbol}: {prev_action} -> {analysis['action']}")
+                elif time_since_last_update >= self.price_update_interval:
+                    logger.debug(f"Scheduled price update for {symbol} after {time_since_last_update:.1f}s")
+            else:
+                logger.debug(f"Skipping update for {symbol}: no signal change and last updated {time_since_last_update:.1f}s ago")
+            
+            # If we should update, do so
+            if should_update:
+                try:
+                    # Update Google Sheet
+                    updated = self.sheets.update_analysis(row_index, analysis)
+                    
+                    if updated:
+                        # Update the last update time for this coin
+                        self._last_update_times[symbol] = current_time
+                        
+                        # Send notification only for BUY signals (as required) when action changes
+                        if analysis["action"] == "BUY" and prev_action != "BUY":
+                            self.telegram.send_signal(analysis)
+                    else:
+                        logger.warning(f"Failed to update sheet for {symbol}")
+                        # Track failure for back-off mechanism
+                        if symbol in self._failed_updates:
+                            _, fail_count = self._failed_updates[symbol]
+                            self._failed_updates[symbol] = (current_time, fail_count + 1)
+                        else:
+                            self._failed_updates[symbol] = (current_time, 1)
+                except Exception as e:
+                    logger.error(f"Error updating sheet for {symbol}: {str(e)}")
+                    # Track failure
+                    if symbol in self._failed_updates:
+                        _, fail_count = self._failed_updates[symbol]
+                        self._failed_updates[symbol] = (current_time, fail_count + 1)
+                    else:
+                        self._failed_updates[symbol] = (current_time, 1)
+            
+            # Store current action for next comparison
+            self._previous_actions[symbol] = analysis["action"]
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {str(e)}")
+            # Track this failure
+            if symbol in self._failed_updates:
+                _, fail_count = self._failed_updates[symbol]
+                self._failed_updates[symbol] = (current_time, fail_count + 1)
+            else:
+                self._failed_updates[symbol] = (current_time, 1)
+            
+            # If we've failed too many times, log a special message
+            _, fail_count = self._failed_updates.get(symbol, (0, 0))
+            if fail_count > 3:
+                logger.warning(f"Symbol {symbol} has failed {fail_count} times in a row")
+            
             return None
-        
-        # Add original symbol to the analysis data
-        if "original_symbol" not in analysis and original_symbol != symbol:
-            analysis["original_symbol"] = original_symbol
-        
-        # Update Google Sheet
-        updated = self.sheets.update_analysis(row_index, analysis)
-        
-        # Send notification if needed
-        if updated and analysis["action"] in ["BUY", "SELL"]:
-            self.telegram.send_signal(analysis)
-        
-        return analysis
     
     def send_initial_analysis(self, analysis, pair_info):
         """Send initial analysis for all coins when the bot starts"""
@@ -657,11 +1159,13 @@ class TradingBot:
         
     def process_pair(self, pair_info):
         """Process a single trading pair - legacy method for compatibility"""
-        return self.process_pair_and_get_analysis(pair_info)
+        return self.process_pair_and_get_analysis(pair)
     
     def run(self):
         """Run the trading bot"""
-        logger.info(f"Starting trading bot with {self.update_interval}s interval")
+        logger.info(f"Starting trading bot with {self.update_interval}s interval, price updates every {self.price_update_interval}s")
+        logger.info(f"Trading pairs will be refreshed from sheet every 3 minutes with new coin detection")
+        logger.info(f"Data value change detection enabled to minimize API calls")
         
         try:
             # Send startup notification to Telegram
@@ -673,21 +1177,68 @@ class TradingBot:
             # Flag to indicate first run
             first_run = True
             
+            # Initialize last update time for sheets status display
+            last_stats_time = time.time()
+            total_api_calls = 0
+            skipped_api_calls = 0
+            failed_updates = 0
+            saved_updates = 0  # Track updates saved due to no value change
+            
+            # Last trades check time to avoid hitting rate limits
+            last_pairs_log_time = 0
+            
             while True:
                 start_time = time.time()
                 
-                # Get all trading pairs
-                pairs = self.sheets.get_trading_pairs()
+                # Check if it's time for daily summary
+                self.telegram.send_daily_summary(list(self.analyzed_pairs.values()))
                 
-                if not pairs:
-                    logger.warning("No trading pairs found, waiting...")
+                # Force refresh trading pairs periodically to ensure we don't miss any updates
+                force_refresh = False
+                if time.time() - self._last_force_refresh > self._force_sheet_refresh_interval:
+                    logger.info("Forcing trading pairs refresh to ensure we don't miss updates")
+                    force_refresh = True
+                    self._last_force_refresh = time.time()
+                
+                try:
+                    # Get all trading pairs - this uses caching to avoid rate limits
+                    pairs = self.sheets.get_trading_pairs()
+                    
+                    # Log count less frequently to avoid log spam
+                    if time.time() - last_pairs_log_time > 60:  # Log once per minute
+                        logger.info(f"Working with {len(pairs)} trading pairs")
+                        
+                        # Also log any coins with persistent failures
+                        persistent_fails = [s for s, (_, count) in self._failed_updates.items() if count > 3]
+                        if persistent_fails:
+                            logger.warning(f"Coins with persistent update issues: {', '.join(persistent_fails)}")
+                        
+                        # Log how many API calls we saved
+                        if saved_updates > 0:
+                            logger.info(f"Saved {saved_updates} Sheet updates due to no significant data changes")
+                            saved_updates = 0  # Reset counter
+                        
+                        last_pairs_log_time = time.time()
+                    
+                    if not pairs:
+                        logger.warning("No trading pairs found, waiting...")
+                        time.sleep(self.update_interval)
+                        continue
+                except Exception as e:
+                    logger.error(f"Error fetching trading pairs: {str(e)}")
                     time.sleep(self.update_interval)
                     continue
                 
-                # On first run, send all analyses
+                # On first run, send intro message
                 if first_run:
                     self.telegram.send_message("📊 *Initial Analysis Results* 📊\n\nDetailed analyses of all coins below:")
                     time.sleep(1)  # Small delay to let the message go through
+                
+                # Count API calls for this cycle
+                cycle_api_calls = 0
+                cycle_skipped_calls = 0
+                cycle_failed_updates = 0
+                cycle_saved_updates = 0
                 
                 # Process pairs in batches
                 for i in range(0, len(pairs), self.batch_size):
@@ -706,13 +1257,29 @@ class TradingBot:
                             # Process the pair
                             analysis = self.process_pair_and_get_analysis(pair)
                             
-                            # On first run, send analysis for all coins regardless of signal
+                            # Track API call stats
+                            if analysis:
+                                if symbol in self._last_update_times and time.time() - self._last_update_times[symbol] < 1:
+                                    # If it was updated in this cycle, count as API call
+                                    cycle_api_calls += 1
+                                else:
+                                    # If it was skipped due to no changes, count as saved update
+                                    if time.time() - self._last_update_times.get(symbol, 0) > self.price_update_interval:
+                                        cycle_saved_updates += 1
+                                    # Otherwise it was skipped due to time
+                                    else:
+                                        cycle_skipped_calls += 1
+                            else:
+                                # Failed updates
+                                cycle_failed_updates += 1
+                            
+                            # On first run, send initial analysis for ALL coins regardless of signal
                             if first_run and analysis:
-                                # Construct a simplified message for initial analysis
                                 self.send_initial_analysis(analysis, pair)
                                 
                         except Exception as e:
                             logger.error(f"Error processing {symbol}: {str(e)}")
+                            cycle_failed_updates += 1
                             # Add to problem symbols after 3 consecutive failures
                             if not hasattr(self, "_symbol_failures"):
                                 self._symbol_failures = {}
@@ -722,22 +1289,30 @@ class TradingBot:
                             if self._symbol_failures.get(symbol, 0) >= 3:
                                 problem_symbols.add(symbol)
                                 logger.warning(f"Adding {symbol} to problem symbols after 3 failures")
-                                
-                                # Let the user know about this issue
-                                self.telegram.send_message(
-                                    f"⚠️ *Problem Alert*\n\n"
-                                    f"Unable to retrieve data for '{symbol}'.\n"
-                                    f"This symbol could not be found on TradingView.\n"
-                                    f"The symbol has been temporarily excluded from monitoring."
-                                )
                         
-                        # Small delay between API calls
-                        time.sleep(1)
+                        # Small delay between API calls to avoid rate limiting
+                        time.sleep(0.2)
                     
                     # Delay between batches to avoid rate limits
                     if i + self.batch_size < len(pairs):
                         logger.info("Batch complete, waiting before next batch...")
-                        time.sleep(5)
+                        time.sleep(1)
+                
+                # Update API calls statistics
+                total_api_calls += cycle_api_calls
+                skipped_api_calls += cycle_skipped_calls
+                failed_updates += cycle_failed_updates
+                saved_updates += cycle_saved_updates
+                
+                # Log API call statistics every minute
+                if time.time() - last_stats_time > 60:
+                    logger.info(f"API call statistics: {total_api_calls} made, {skipped_api_calls} skipped, {failed_updates} failed, {saved_updates} saved")
+                    last_stats_time = time.time()
+                    # Reset counters
+                    total_api_calls = 0
+                    skipped_api_calls = 0
+                    failed_updates = 0
+                    # saved_updates is reset after logging above
                 
                 # Reset first run flag after the first complete cycle
                 if first_run:
@@ -756,7 +1331,8 @@ class TradingBot:
                 elapsed = time.time() - start_time
                 sleep_time = max(0, self.update_interval - elapsed)
                 
-                logger.info(f"Completed cycle in {elapsed:.2f}s, next update in {sleep_time:.2f}s...")
+                # Log with API call statistics for this cycle
+                logger.info(f"Completed cycle in {elapsed:.2f}s with {cycle_api_calls} API calls, {cycle_skipped_calls} skipped, {cycle_failed_updates} failed, {cycle_saved_updates} saved. Next update in {sleep_time:.2f}s...")
                 time.sleep(sleep_time)
                 
         except KeyboardInterrupt:
