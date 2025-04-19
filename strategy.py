@@ -544,12 +544,13 @@ class GoogleSheetIntegration:
             row_values = self.worksheet.row_values(row_index)
             
             # Map to our expected column indices (if row doesn't have enough values, return empty dict)
-            if len(row_values) < 27:  # We need at least up to column AA (27 columns)
+            if len(row_values) < 33:  # We need at least up to column AF (33 columns)
                 return {}
                 
             # Map the values to our expected structure
             values = {
                 "last_price": row_values[2] if len(row_values) > 2 else "",  # Column C
+                "buy_target": row_values[3] if len(row_values) > 3 else "",  # Column D
                 "action": row_values[4] if len(row_values) > 4 else "",      # Column E
                 "take_profit": row_values[5] if len(row_values) > 5 else "",  # Column F
                 "stop_loss": row_values[6] if len(row_values) > 6 else "",    # Column G
@@ -559,6 +560,7 @@ class GoogleSheetIntegration:
                 "resistance": row_values[20] if len(row_values) > 20 else "",   # Column U
                 "support": row_values[21] if len(row_values) > 21 else "",      # Column V
                 "timestamp": row_values[22] if len(row_values) > 22 else "",    # Column W
+                "ma50": row_values[25] if len(row_values) > 25 else "",         # Column Z
                 "ema10": row_values[26] if len(row_values) > 26 else "",        # Column AA
                 "ma50_valid": row_values[27] if len(row_values) > 27 else "",   # Column AB
                 "ema10_valid": row_values[28] if len(row_values) > 28 else ""   # Column AC
@@ -589,6 +591,7 @@ class GoogleSheetIntegration:
         # Convert all values to strings for comparison
         new_values = {
             "last_price": str(data["last_price"]),
+            "buy_target": str(data.get("buy_target", data["last_price"])),
             "action": data["action"],
             "rsi": str(data["rsi"]),
             "ma200": str(data["ma200"]),
@@ -596,6 +599,7 @@ class GoogleSheetIntegration:
             "resistance": str(data["resistance"]),
             "support": str(data["support"]),
             "timestamp": data["timestamp"],
+            "ma50": str(data["ma50"]),
             "ema10": str(data["ema10"]),
             "ma50_valid": "YES" if data["ma50_valid"] else "NO",
             "ema10_valid": "YES" if data["ema10_valid"] else "NO"
@@ -634,6 +638,17 @@ class GoogleSheetIntegration:
         except:
             # If conversion fails, consider it changed
             changes.append("RSI: conversion error")
+        
+        # Check MA50 change
+        try:
+            curr_ma50 = float(current_values.get("ma50", "0").replace(',', '.'))
+            new_ma50 = float(new_values["ma50"])
+            # If MA50 change is significant, consider it changed
+            if abs(curr_ma50 - new_ma50) / max(curr_ma50, 1e-10) > 0.01:  # 1% change
+                changes.append(f"MA50: {curr_ma50} -> {new_ma50}")
+        except:
+            # If conversion fails, consider it changed
+            changes.append("MA50: conversion error")
             
         # For other indicators, just check if they're different
         if current_values.get("ma200_valid", "") != new_values["ma200_valid"]:
@@ -667,6 +682,8 @@ class GoogleSheetIntegration:
             cells_to_update = [
                 # Last Price (column C)
                 {"row": row_index, "col": 3, "value": data["last_price"]},
+                # Buy Target (column D)
+                {"row": row_index, "col": 4, "value": data["buy_target"] if "buy_target" in data else data["last_price"]},
                 # RSI (column R)
                 {"row": row_index, "col": 18, "value": data["rsi"]},
                 # MA200 (column S)
@@ -679,12 +696,18 @@ class GoogleSheetIntegration:
                 {"row": row_index, "col": 22, "value": data["support"]},
                 # Last Updated (column W)
                 {"row": row_index, "col": 23, "value": data["timestamp"]},
+                # MA50 (column Z)
+                {"row": row_index, "col": 26, "value": data["ma50"]},
                 # EMA10 (column AA)
                 {"row": row_index, "col": 27, "value": data["ema10"]},
                 # MA50 Valid (column AB)
                 {"row": row_index, "col": 28, "value": "YES" if data["ma50_valid"] else "NO"},
                 # EMA10 Valid (column AC)
                 {"row": row_index, "col": 29, "value": "YES" if data["ema10_valid"] else "NO"},
+                # Source (column AE)
+                {"row": row_index, "col": 31, "value": "TradingView"},
+                # Enable Margin Trading (column AF)
+                {"row": row_index, "col": 32, "value": "NO"},
                 # Buy Signal (column E)
                 {"row": row_index, "col": 5, "value": data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"])}
             ]
@@ -714,6 +737,7 @@ class GoogleSheetIntegration:
                 "resistance": str(data["resistance"]),
                 "support": str(data["support"]),
                 "timestamp": data["timestamp"],
+                "ma50": str(data["ma50"]),
                 "ema10": str(data["ema10"]),
                 "ma50_valid": "YES" if data["ma50_valid"] else "NO",
                 "ema10_valid": "YES" if data["ema10_valid"] else "NO"
@@ -752,37 +776,41 @@ class GoogleSheetIntegration:
     def _update_with_smaller_batches(self, row_index, data):
         """Update sheet using smaller batches to work around rate limits"""
         try:
-            # First batch: Update price and core indicators
+            # First batch: Update price, buy target and core indicators
             batch1 = [
                 self.worksheet.cell(row_index, 3, data["last_price"]),
+                self.worksheet.cell(row_index, 4, data["buy_target"] if "buy_target" in data else data["last_price"]),  # Buy Target
                 self.worksheet.cell(row_index, 18, data["rsi"]),
                 self.worksheet.cell(row_index, 19, data["ma200"])
             ]
             self.worksheet.update_cells(batch1)
             time.sleep(2)  # Wait between batches
             
-            # Second batch: Update validations
+            # Second batch: Update validations and MA50
             batch2 = [
                 self.worksheet.cell(row_index, 20, "YES" if data["ma200_valid"] else "NO"),
+                self.worksheet.cell(row_index, 26, data["ma50"]),  # MA50 in column Z (26)
                 self.worksheet.cell(row_index, 28, "YES" if data["ma50_valid"] else "NO"),
                 self.worksheet.cell(row_index, 29, "YES" if data["ema10_valid"] else "NO")
             ]
             self.worksheet.update_cells(batch2)
             time.sleep(2)  # Wait between batches
             
-            # Third batch: Update support/resistance and timestamps
+            # Third batch: Update support/resistance, timestamps, EMA10 and Source
             batch3 = [
                 self.worksheet.cell(row_index, 21, data["resistance"]),
                 self.worksheet.cell(row_index, 22, data["support"]),
                 self.worksheet.cell(row_index, 23, data["timestamp"]),
-                self.worksheet.cell(row_index, 27, data["ema10"])
+                self.worksheet.cell(row_index, 27, data["ema10"]),  # EMA10 in column AA (27)
+                self.worksheet.cell(row_index, 31, "TradingView")  # Source in column AE (31)
             ]
             self.worksheet.update_cells(batch3)
             time.sleep(2)  # Wait between batches
             
-            # Fourth batch: Update action and take profit/stop loss
+            # Fourth batch: Update action, take profit, stop loss and margin trading
             batch4 = [
-                self.worksheet.cell(row_index, 5, data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"]))
+                self.worksheet.cell(row_index, 5, data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"])),
+                self.worksheet.cell(row_index, 32, "NO")  # Enable Margin Trading
             ]
             
             if data["action"] == "BUY":

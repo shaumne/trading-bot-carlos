@@ -873,20 +873,85 @@ class GoogleSheetTradeManager:
         
         # SELL signal processing
         elif action == "SELL":
-            # Check if we have an active position to sell
-            if symbol not in self.active_positions:
-                logger.warning(f"No active position found for {symbol}, cannot sell")
-                return False
-                
-            # Get current position details
-            position = self.active_positions[symbol]
             price = float(trade_signal['last_price'])
-            quantity = position['quantity']
+            original_symbol = trade_signal['original_symbol']
             
-            logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price} based on SELL signal")
-            
-            # Execute the sell
-            return self.execute_sell(symbol, price)
+            try:
+                # Check if we have an active position to sell
+                if symbol in self.active_positions:
+                    # Get position details from our tracking system
+                    position = self.active_positions[symbol]
+                    quantity = position['quantity']
+                    logger.info(f"Found active position for {symbol}, selling {quantity} at {price}")
+                else:
+                    # No position tracked in our system, but we still want to try selling
+                    # This could happen if position was opened manually or tracking was lost
+                    logger.warning(f"No active position found for {symbol} in tracking system, attempting to sell anyway")
+                    
+                    # Try to get balance from exchange to determine quantity
+                    base_currency = original_symbol
+                    try:
+                        # Get balance for the base currency (e.g., for SUI_USDT, get SUI balance)
+                        balance = self.exchange_api.get_balance(base_currency)
+                        if balance > 0:
+                            quantity = balance
+                            logger.info(f"Found balance of {quantity} {base_currency} to sell")
+                        else:
+                            logger.warning(f"No balance found for {base_currency}, cannot sell")
+                            return False
+                    except Exception as e:
+                        logger.error(f"Error getting balance for {base_currency}: {str(e)}")
+                        return False
+                    
+                    # Create a position entry in our tracking system
+                    self.active_positions[symbol] = {
+                        'order_id': 'manual',
+                        'row_index': row_index,
+                        'quantity': quantity,
+                        'price': price,
+                        'stop_loss': price * 0.9,  # Default values
+                        'take_profit': price * 1.1,
+                        'status': 'POSITION_ACTIVE'
+                    }
+                    
+                # Execute the sell
+                logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price} based on SELL signal")
+                
+                # Create sell order
+                order_id = self.exchange_api.create_order(
+                    instrument_name=symbol,
+                    side="SELL",
+                    price=price,
+                    quantity=quantity
+                )
+                
+                if not order_id:
+                    logger.error(f"Failed to create sell order for {symbol}")
+                    return False
+                    
+                # Monitor the sell order
+                order_filled = self.exchange_api.monitor_order(order_id)
+                
+                if order_filled:
+                    # Update sheet with sell information
+                    self.update_trade_status(
+                        row_index,
+                        "SOLD",
+                        sell_price=price,
+                        quantity=quantity
+                    )
+                    
+                    # Remove from active positions
+                    if symbol in self.active_positions:
+                        del self.active_positions[symbol]
+                    return True
+                else:
+                    logger.warning(f"Sell order {order_id} for {symbol} was not filled")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Error executing sell for {symbol}: {str(e)}")
+                return False
     
     def monitor_position(self, symbol, order_id):
         """Monitor a position for order fill and status updates"""
