@@ -329,9 +329,46 @@ class CryptoExchangeAPI:
             logger.error(f"Failed to get balance. Error {error_code}: {error_msg}")
             return None
     
-    def sell_coin(self, instrument_name, quantity):
-        """Sell coin using market order with specified quantity"""
-        logger.info(f"Creating market sell order for {instrument_name}, quantity: {quantity}")
+    def sell_coin(self, instrument_name, quantity=None):
+        """Sell coin using market order with coin's available balance (95%)"""
+        # Extract base currency from instrument_name (e.g. SUI from SUI_USDT)
+        base_currency = instrument_name.split('_')[0]
+        
+        logger.info(f"Getting balance for {base_currency} to sell")
+        
+        # Get available balance for the coin
+        available_balance = self.get_coin_balance(base_currency)
+        
+        if not available_balance or available_balance == "0":
+            logger.error(f"No available balance found for {base_currency}")
+            return False
+            
+        # Convert to float
+        available_balance = float(available_balance)
+        
+        # Calculate 95% of available balance
+        sell_quantity = available_balance * 0.95
+        
+        # Format quantity based on coin type (each exchange has different precision requirements)
+        # Crypto.com has specific format requirements - we need to test and find the correct ones
+        if base_currency == "SUI":
+            # For SUI, use 1 decimal place (based on error messages)
+            sell_quantity = int(sell_quantity)  # Use integer value for SUI
+            logger.info(f"Using integer format for SUI: {sell_quantity}")
+        elif base_currency == "XRP":
+            # XRP typically requires fewer decimal places
+            sell_quantity = int(sell_quantity)
+        elif base_currency in ["BTC", "ETH"]:
+            # High value coins typically use more decimals
+            sell_quantity = round(sell_quantity, 6)
+        elif base_currency in ["SHIB", "DOGE", "BONK"]:
+            # Very low value coins often use whole numbers
+            sell_quantity = int(sell_quantity)
+        else:
+            # Default formatting: 2 decimal places for most coins
+            sell_quantity = round(sell_quantity, 2)
+        
+        logger.info(f"Creating market sell order for {instrument_name}, quantity: {sell_quantity} (formatted from 95% of {available_balance})")
         
         # IMPORTANT: Use the exact method format from documentation
         method = "private/create-order"
@@ -341,7 +378,7 @@ class CryptoExchangeAPI:
             "instrument_name": instrument_name,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": str(quantity)
+            "quantity": str(sell_quantity)
         }
         
         # Send order request
@@ -364,6 +401,36 @@ class CryptoExchangeAPI:
         else:
             error_code = response.get("code")
             error_msg = response.get("message", response.get("msg", "Unknown error"))
+            
+            # If invalid quantity format, try again with different formatting
+            if error_code == 213 and "Invalid quantity format" in error_msg:
+                logger.warning(f"Invalid quantity format. Trying again with integer value.")
+                # Try with integer quantity as fallback
+                sell_quantity = int(sell_quantity)
+                
+                # Update params with integer quantity
+                params["quantity"] = str(sell_quantity)
+                logger.info(f"Retrying with quantity: {sell_quantity}")
+                
+                # Retry the request
+                retry_response = self.send_request(method, params)
+                
+                if retry_response.get("code") == 0:
+                    retry_order_id = None
+                    if "result" in retry_response and "order_id" in retry_response.get("result", {}):
+                        retry_order_id = retry_response.get("result", {}).get("order_id")
+                    
+                    if retry_order_id:
+                        logger.info(f"Retry sell order successful! Order ID: {retry_order_id}")
+                        return retry_order_id
+                    else:
+                        logger.info(f"Retry sell order successful, but couldn't find order ID")
+                        return True
+                else:
+                    error_code = retry_response.get("code")
+                    error_msg = retry_response.get("message", retry_response.get("msg", "Unknown error"))
+                    logger.error(f"Retry also failed. Error {error_code}: {error_msg}")
+            
             logger.error(f"Failed to create sell order. Error {error_code}: {error_msg}")
             logger.error(f"Full response: {json.dumps(response, indent=2)}")
             return False
@@ -380,7 +447,7 @@ class CryptoExchangeAPI:
             response = self.send_request(method, params)
             
             if response.get("code") == 0:
-                order_detail = response.get("result", {}).get("order_info", {})
+                order_detail = response.get("result", {})
                 status = order_detail.get("status")
                 logger.debug(f"Order {order_id} status: {status}")
                 return status
@@ -519,7 +586,10 @@ class GoogleSheetTradeManager:
                 trade_value = row.get('TRADE', '').upper()
                 is_active = trade_value in ['YES', 'Y', 'TRUE', '1']
                 buy_signal = row.get('Buy Signal', '').upper()
-                tradable = row.get('Tradable', 'YES').upper() == 'YES'
+                
+                # Check if Tradable is YES - if column exists, default to YES if not found
+                tradable_value = row.get('Tradable', 'YES').upper()
+                tradable = tradable_value in ['YES', 'Y', 'TRUE', '1']
                 
                 # Skip if not active or not tradable
                 if not is_active or not tradable:
@@ -657,27 +727,58 @@ class GoogleSheetTradeManager:
     def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None):
         """Update trade status in Google Sheet"""
         try:
-            # Update Order Placed? (column H)
+            # Kolon indeksleri (1-indexed):
+            # 1: TRADE
+            # 2: Coin
+            # 3: Last Price
+            # 4: Buy Target
+            # 5: Buy Signal
+            # 6: Take Profit
+            # 7: Stop-Loss
+            # 8: Order Placed?
+            # 9: Order Date
+            # 10: Purchase Price
+            # 11: Quantity
+            # 12: Purchase Date
+            # 13: Sold?
+            # 14: Sell Price
+            # 15: Sell Quantity
+            # 16: Sold Date
+            # 17: Notes
+            # 33: order_id
+            # 34: Tradable (yeni eklenen kolon)
+            logger.info(f"Updating trade status for row {row_index}: {status} with correct column mapping")
+            
+            # Order Placed? (column 8)
             self.worksheet.update_cell(row_index, 8, status)
             
-            # Set Tradable to NO when order is placed (column AG - after column AF, position 33)
+            # When order is placed
             if status == "ORDER_PLACED":
-                self.worksheet.update_cell(row_index, 33, "NO")
+                # Set Tradable to NO (kolon 34)
+                tradable_col = 34
+                try:
+                    self.worksheet.update_cell(row_index, tradable_col, "NO")
+                    logger.info(f"Set Tradable to NO in column {tradable_col}")
+                except Exception as e:
+                    logger.error(f"Error updating Tradable column: {str(e)}")
                 
-                # Update timestamp (column I - Order Date)
+                # Update Order Date (column 9)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.worksheet.update_cell(row_index, 9, timestamp)
                 
                 if purchase_price:
-                    # Update Purchase Price (column J)
+                    # Update Purchase Price (column 10)
                     self.worksheet.update_cell(row_index, 10, str(purchase_price))
                 
                 if quantity:
-                    # Update Quantity (column K)
+                    # Update Quantity (column 11)
                     self.worksheet.update_cell(row_index, 11, str(quantity))
                     
+                # Update Purchase Date (column 12)
+                self.worksheet.update_cell(row_index, 12, timestamp)
+                
                 if order_id:
-                    # Store the order ID in both Notes (column Q) and order_id column
+                    # Store the order ID in Notes (column 17)
                     self.worksheet.update_cell(row_index, 17, f"Order ID: {order_id}")
                     
                     # Also store in the order_id column if it exists
@@ -689,36 +790,51 @@ class GoogleSheetTradeManager:
             
             # When position is sold
             elif status == "SOLD":
-                # Update Sold? (column M)
+                logger.info(f"Updating sheet for SOLD status in row {row_index}")
+                
+                # Change Buy Signal to WAIT (column 5)
+                self.worksheet.update_cell(row_index, 5, "WAIT")
+                logger.info(f"Updated Buy Signal to WAIT for row {row_index}")
+                
+                # Update Sold? (column 13)
                 self.worksheet.update_cell(row_index, 13, "YES")
                 
                 if sell_price:
-                    # Update Sell Price (column N)
+                    # Update Sell Price (column 14)
                     self.worksheet.update_cell(row_index, 14, str(sell_price))
                 
                 if quantity:
-                    # Update Sell Quantity (column O)
+                    # Update Sell Quantity (column 15)
                     self.worksheet.update_cell(row_index, 15, str(quantity))
                 
-                # Update Sold Date (column P)
+                # Update Sold Date (column 16)
                 sold_date = sell_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.worksheet.update_cell(row_index, 16, sold_date)
                 
-                # Set Tradable back to YES (column AG - after column AF, position 33)
-                self.worksheet.update_cell(row_index, 33, "YES")
+                # Set Tradable back to YES (kolon 34)
+                tradable_col = 34
+                try:
+                    self.worksheet.update_cell(row_index, tradable_col, "YES")
+                    logger.info(f"Set Tradable back to YES in column {tradable_col}")
+                except Exception as e:
+                    logger.error(f"Error updating Tradable column: {str(e)}")
                 
                 # Add note that position is closed
-                current_notes = self.worksheet.cell(row_index, 17).value
-                new_notes = f"{current_notes} | Position closed: {sold_date}"
-                self.worksheet.update_cell(row_index, 17, new_notes)
+                try:
+                    current_notes = self.worksheet.cell(row_index, 17).value or ""
+                    new_notes = f"{current_notes} | Position closed: {sold_date}"
+                    self.worksheet.update_cell(row_index, 17, new_notes)
+                except Exception as e:
+                    logger.error(f"Error updating Notes column: {str(e)}")
                 
                 # Clear the order_id after selling
                 headers = self.worksheet.row_values(1)
                 if 'order_id' in headers:
                     order_id_col = headers.index('order_id') + 1
                     self.worksheet.update_cell(row_index, order_id_col, "")
+                    logger.info(f"Cleared order_id in column {order_id_col} for row {row_index}")
             
-            logger.info(f"Updated trade status for row {row_index}: {status}")
+            logger.info(f"Successfully updated trade status for row {row_index}: {status}")
             return True
         except Exception as e:
             logger.error(f"Error updating trade status: {str(e)}")
@@ -736,8 +852,8 @@ class GoogleSheetTradeManager:
             take_profit = float(trade_signal['take_profit'])
             stop_loss = float(trade_signal['stop_loss'])
             
-            # Always use Buy Target price if available, otherwise use Last Price
-            price = float(trade_signal.get('buy_target', trade_signal['last_price']))
+            # Basit fiyat bilgisi için sadece last_price kullan (sadece loglama ve sheet için)
+            price = float(trade_signal['last_price'])
             
             # Check if we have an active position for this symbol
             if symbol in self.active_positions:
@@ -751,34 +867,12 @@ class GoogleSheetTradeManager:
                 return False
             
             try:
-                # Calculate quantity based on trade amount and price
+                # USDT olarak işlem miktarı - quantity hesaplamasına gerek yok
                 trade_amount = self.exchange_api.trade_amount
                 
-                # Calculate quantity - different precision for different price ranges
-                if price < 0.1:
-                    # For very low prices (e.g. BONK), use more decimal places
-                    quantity = round(trade_amount / price, 2)
-                elif price < 1:
-                    # For prices below $1, use 4 decimal places
-                    quantity = round(trade_amount / price, 4)
-                elif price < 10:
-                    # For prices below $10, use 3 decimal places
-                    quantity = round(trade_amount / price, 3)
-                elif price < 100:
-                    # For prices below $100, use 2 decimal places
-                    quantity = round(trade_amount / price, 2)
-                else:
-                    # For higher prices, use 1 decimal place
-                    quantity = round(trade_amount / price, 1)
-                    
-                # For very low-value coins like SHIB or BONK, need special handling
-                if price < 0.0001:
-                    # Just buy a large whole number instead of fractional amount
-                    quantity = int(trade_amount / price)
+                logger.info(f"Placing market buy order for {symbol} with ${trade_amount} USDT")
                 
-                logger.info(f"Placing order: BUY {quantity} {symbol} at {price} with stop_loss={stop_loss} and take_profit={take_profit}")
-                
-                # Use the new buy_coin method
+                # Use the buy_coin method with dollar amount
                 order_id = self.exchange_api.buy_coin(symbol, trade_amount)
                 
                 if not order_id:
@@ -786,14 +880,17 @@ class GoogleSheetTradeManager:
                     self.update_trade_status(row_index, "ORDER_FAILED")
                     return False
                 
+                # Quantity için varsayılan değer (sheet güncellemesi için)
+                estimated_quantity = trade_amount / price if price > 0 else 0
+                
                 # Update trade status in sheet including order_id
-                self.update_trade_status(row_index, "ORDER_PLACED", order_id, purchase_price=price, quantity=quantity)
+                self.update_trade_status(row_index, "ORDER_PLACED", order_id, purchase_price=price, quantity=estimated_quantity)
                 
                 # Add to active positions
                 self.active_positions[symbol] = {
                     'order_id': order_id,
                     'row_index': row_index,
-                    'quantity': quantity,
+                    'quantity': estimated_quantity,  # Tahmini miktar
                     'price': price,
                     'stop_loss': stop_loss,
                     'take_profit': take_profit,
@@ -886,88 +983,210 @@ class GoogleSheetTradeManager:
                             return False
                     
                 # Execute the sell with sell_coin method
-                logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price} based on SELL signal")
+                logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price}")
                 
                 # Create sell order
-                sell_order_id = self.exchange_api.sell_coin(symbol, quantity)
+                sell_order_id = self.exchange_api.sell_coin(symbol)
                 
                 if not sell_order_id:
                     logger.error(f"Failed to create sell order for {symbol}")
                     return False
                     
-                # Monitor the sell order
-                order_filled = self.exchange_api.monitor_order(sell_order_id)
+                # Monitor the sell order - wait a moment before checking
+                time.sleep(2)
+                status = self.exchange_api.get_order_status(sell_order_id)
+                logger.info(f"Initial order status for {sell_order_id}: {status}")
                 
-                if order_filled:
-                    # Update sheet with sell information
-                    self.update_trade_status(
-                        row_index,
-                        "SOLD",
-                        sell_price=price,
-                        quantity=quantity
-                    )
+                # Assume order is filled for now (we'll check status in monitor_order)
+                # This is because sometimes the order is filled so quickly that monitoring misses it
+                
+                # Update sheet with sell information immediately
+                actual_quantity = quantity  # Default to the quantity we had
+                
+                # Try to get actual quantity from response if possible
+                try:
+                    method = "private/get-order-detail"
+                    params = {"order_id": sell_order_id}
+                    order_detail = self.exchange_api.send_request(method, params)
                     
-                    # Remove from active positions
-                    if symbol in self.active_positions:
-                        del self.active_positions[symbol]
-                    return True
-                else:
-                    logger.warning(f"Sell order {sell_order_id} for {symbol} was not filled")
-                    return False
+                    if order_detail.get("code") == 0:
+                        result = order_detail.get("result", {})
+                        if "cumulative_quantity" in result:
+                            actual_quantity = float(result.get("cumulative_quantity"))
+                            logger.info(f"Got actual sold quantity from order details: {actual_quantity}")
+                        if "avg_price" in result:
+                            price = float(result.get("avg_price"))
+                            logger.info(f"Got actual sell price from order details: {price}")
+                except Exception as e:
+                    logger.error(f"Error getting order details after sell: {str(e)}")
+                
+                # Update sheet regardless of monitoring result
+                self.update_trade_status(
+                    row_index,
+                    "SOLD",
+                    sell_price=price,
+                    quantity=actual_quantity
+                )
+                
+                # Start monitoring in background to confirm fill
+                monitor_thread = threading.Thread(
+                    target=self.monitor_sell_order,
+                    args=(symbol, sell_order_id, row_index),
+                    daemon=True
+                )
+                monitor_thread.start()
+                
+                # Remove from active positions
+                if symbol in self.active_positions:
+                    del self.active_positions[symbol]
+                
+                logger.info(f"Completed sell for {symbol}, sheet updated")
+                return True
                     
             except Exception as e:
                 logger.error(f"Error executing sell for {symbol}: {str(e)}")
-                return False 
+                return False
 
     def monitor_position(self, symbol, order_id):
         """Monitor a position for order fill and status updates"""
         try:
-            # Monitor the order until it's filled or cancelled
-            order_filled = self.exchange_api.monitor_order(order_id)
+            # Wait a moment for order processing
+            time.sleep(5)
             
-            if not order_filled:
-                logger.warning(f"Order {order_id} for {symbol} was not filled")
+            # Check order status
+            status = self.exchange_api.get_order_status(order_id)
+            logger.info(f"Initial order status for {order_id}: {status}")
+            
+            # For CANCELED orders, update immediately
+            if status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                logger.warning(f"Order {order_id} for {symbol} was {status}")
                 if symbol in self.active_positions:
                     row_index = self.active_positions[symbol]['row_index']
-                    self.update_trade_status(row_index, "ORDER_CANCELLED")
-                    # Reset Tradable to YES since order was cancelled (column AG - after column AF)
-                    self.worksheet.update_cell(row_index, 33, "YES")
+                    
+                    # Update order status in sheet
+                    self.update_trade_status(row_index, f"ORDER_{status}")
+                    
+                    # Set Buy Signal back to WAIT
+                    self.worksheet.update_cell(row_index, 5, "WAIT")
+                    logger.info(f"Reset Buy Signal to WAIT for row {row_index}")
+                    
+                    # Set Tradable back to YES
+                    try:
+                        tradable_col = 34
+                        self.worksheet.update_cell(row_index, tradable_col, "YES")
+                        logger.info(f"Reset Tradable to YES for row {row_index}")
+                    except Exception as e:
+                        logger.error(f"Error updating Tradable column: {str(e)}")
+                    
+                    # Remove from active positions
                     del self.active_positions[symbol]
                 return
             
-            # Order is filled, update position status
+            # For filled orders or those still processing, continue monitoring
+            max_checks = 12
+            check_interval = 5
+            checks = 0
+            
+            while checks < max_checks:
+                status = self.exchange_api.get_order_status(order_id)
+                logger.info(f"Order {order_id} status check {checks+1}/{max_checks}: {status}")
+                
+                if status == "FILLED":
+                    logger.info(f"Order {order_id} for {symbol} is filled")
+                    if symbol in self.active_positions:
+                        row_index = self.active_positions[symbol]['row_index']
+                        
+                        # Try to get actual quantity from order details
+                        try:
+                            method = "private/get-order-detail"
+                            params = {"order_id": order_id}
+                            order_detail = self.exchange_api.send_request(method, params)
+                            
+                            if order_detail.get("code") == 0:
+                                result = order_detail.get("result", {})
+                                
+                                # Update actual purchase price and quantity
+                                if "avg_price" in result:
+                                    purchase_price = float(result.get("avg_price"))
+                                    logger.info(f"Actual purchase price: {purchase_price}")
+                                    self.active_positions[symbol]['price'] = purchase_price
+                                    self.worksheet.update_cell(row_index, 10, str(purchase_price))
+                                
+                                if "cumulative_quantity" in result:
+                                    quantity = float(result.get("cumulative_quantity"))
+                                    logger.info(f"Actual quantity: {quantity}")
+                                    self.active_positions[symbol]['quantity'] = quantity
+                                    self.worksheet.update_cell(row_index, 11, str(quantity))
+                        except Exception as e:
+                            logger.error(f"Error updating actual purchase details: {str(e)}")
+                        
+                        # Update position status
+                        self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                        self.update_trade_status(row_index, "POSITION_ACTIVE")
+                    return True
+                elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                    logger.warning(f"Order {order_id} for {symbol} was {status}")
+                    if symbol in self.active_positions:
+                        row_index = self.active_positions[symbol]['row_index']
+                        
+                        # Update order status in sheet
+                        self.update_trade_status(row_index, f"ORDER_{status}")
+                        
+                        # Set Buy Signal back to WAIT
+                        self.worksheet.update_cell(row_index, 5, "WAIT")
+                        logger.info(f"Reset Buy Signal to WAIT for row {row_index}")
+                        
+                        # Set Tradable back to YES
+                        try:
+                            tradable_col = 34
+                            self.worksheet.update_cell(row_index, tradable_col, "YES")
+                            logger.info(f"Reset Tradable to YES for row {row_index}")
+                        except Exception as e:
+                            logger.error(f"Error updating Tradable column: {str(e)}")
+                        
+                        # Remove from active positions
+                        del self.active_positions[symbol]
+                    return False
+                
+                logger.debug(f"Order {order_id} status: {status}, checking again in {check_interval} seconds")
+                time.sleep(check_interval)
+                checks += 1
+                
+            logger.warning(f"Monitoring timed out for order {order_id}")
             if symbol in self.active_positions:
                 row_index = self.active_positions[symbol]['row_index']
-                purchase_price = self.active_positions[symbol]['price']
-                quantity = self.active_positions[symbol]['quantity']
                 
-                self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
-                self.update_trade_status(
-                    row_index, 
-                    "POSITION_ACTIVE",
-                    purchase_price=purchase_price,
-                    quantity=quantity
-                )
+                # Mark as timeout in sheet
+                self.update_trade_status(row_index, "MONITOR_TIMEOUT")
                 
-                # Continue monitoring the active position
-                while symbol in self.active_positions and self.active_positions[symbol]['status'] == 'POSITION_ACTIVE':
-                    # Check for sell conditions (this is where you'd implement your exit strategy)
-                    # For now, this is a placeholder for your actual exit logic
-                    
-                    # Placeholder for sell logic - you can replace this with your actual conditions
-                    # such as checking if price has reached take profit or stop loss levels
-                    
-                    # If sell conditions met, execute sell
-                    # self.execute_sell(symbol)
-                    
-                    # For now, we'll just sleep
-                    time.sleep(self.check_interval)
+                # Set Tradable back to YES
+                try:
+                    tradable_col = 34
+                    self.worksheet.update_cell(row_index, tradable_col, "YES")
+                    logger.info(f"Reset Tradable to YES due to timeout for row {row_index}")
+                except Exception as e:
+                    logger.error(f"Error updating Tradable column: {str(e)}")
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
+            return False
             
         except Exception as e:
             logger.error(f"Error monitoring position for {symbol}: {str(e)}")
             if symbol in self.active_positions:
                 row_index = self.active_positions[symbol]['row_index']
                 self.update_trade_status(row_index, "MONITOR_ERROR")
+                
+                # Set Tradable back to YES
+                try:
+                    tradable_col = 34
+                    self.worksheet.update_cell(row_index, tradable_col, "YES")
+                    logger.info(f"Reset Tradable to YES due to error for row {row_index}")
+                except Exception as e:
+                    logger.error(f"Error updating Tradable column: {str(e)}")
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
     
     def execute_sell(self, symbol, price=None):
         """Execute a sell order for an active position"""
@@ -1018,6 +1237,50 @@ class GoogleSheetTradeManager:
                 
         except Exception as e:
             logger.error(f"Error executing sell for {symbol}: {str(e)}")
+            return False
+    
+    def monitor_sell_order(self, symbol, order_id, row_index, check_interval=10, max_checks=6):
+        """Monitor a sell order specifically to confirm it's filled and update sheet accordingly"""
+        try:
+            # Wait briefly before first check
+            time.sleep(check_interval)
+            
+            # Check status a few times
+            for i in range(max_checks):
+                status = self.exchange_api.get_order_status(order_id)
+                logger.info(f"Sell order {order_id} status check {i+1}/{max_checks}: {status}")
+                
+                if status == "FILLED":
+                    logger.info(f"Confirmed sell order {order_id} is filled")
+                    
+                    # Double-check that Google Sheet was updated
+                    try:
+                        # Check if 'Sold?' column is properly set
+                        sold_status = self.worksheet.cell(row_index, 13).value
+                        if sold_status != "YES":
+                            logger.warning(f"Sold status not properly set in sheet, fixing now")
+                            self.update_trade_status(row_index, "SOLD")
+                        
+                        # Ensure Buy Signal is set to WAIT
+                        buy_signal = self.worksheet.cell(row_index, 5).value
+                        if buy_signal != "WAIT":
+                            logger.warning(f"Buy Signal not set to WAIT, fixing now")
+                            self.worksheet.update_cell(row_index, 5, "WAIT")
+                    except Exception as e:
+                        logger.error(f"Error verifying sheet updates after sell: {str(e)}")
+                    
+                    return True
+                elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                    logger.warning(f"Sell order {order_id} failed with status: {status}")
+                    return False
+                
+                time.sleep(check_interval)
+            
+            logger.warning(f"Monitoring timed out for sell order {order_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error monitoring sell order {order_id}: {str(e)}")
             return False
     
     def run(self):

@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import hmac
+import hashlib
+import requests
+import json
+import logging
+import gspread
+import threading
+from datetime import datetime
+from dotenv import load_dotenv
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("sui_trader_sheets.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("sui_trader_sheets")
+
+# Load environment variables
+load_dotenv()
+
+class CryptoExchangeAPI:
+    """Class to handle Crypto.com Exchange API requests using the approaches from sui_trading_script"""
+    
+    def __init__(self):
+        self.api_key = os.getenv("CRYPTO_API_KEY")
+        self.api_secret = os.getenv("CRYPTO_API_SECRET")
+        # Trading URL for buy/sell operations (from sui_trading_script.py)
+        self.trading_base_url = "https://api.crypto.com/exchange/v1/"
+        # Account URL for get-account-summary (from get_account_summary.py)
+        self.account_base_url = "https://api.crypto.com/v2/"
+        self.trade_amount = float(os.getenv("TRADE_AMOUNT", "10"))  # Default trade amount in USDT
+        self.min_balance_required = self.trade_amount * 1.05  # 5% buffer for fees
+        
+        if not self.api_key or not self.api_secret:
+            logger.error("API key or secret not found in environment variables")
+            raise ValueError("CRYPTO_API_KEY and CRYPTO_API_SECRET environment variables are required")
+        
+        logger.info(f"Initialized CryptoExchangeAPI with Trading URL: {self.trading_base_url}, Account URL: {self.account_base_url}")
+        
+        # Test authentication
+        if self.test_auth():
+            logger.info("Authentication successful")
+        else:
+            logger.error("Authentication failed")
+            raise ValueError("Could not authenticate with Crypto.com Exchange API")
+    
+    def params_to_str(self, obj, level=0):
+        """
+        Convert params object to string according to Crypto.com's official algorithm
+        
+        This is EXACTLY the algorithm from the official documentation
+        """
+        MAX_LEVEL = 3  # Maximum recursion level for nested params
+        
+        if level >= MAX_LEVEL:
+            return str(obj)
+
+        if isinstance(obj, dict):
+            # Sort dictionary keys
+            return_str = ""
+            for key in sorted(obj.keys()):
+                return_str += key
+                if obj[key] is None:
+                    return_str += 'null'
+                elif isinstance(obj[key], bool):
+                    return_str += str(obj[key]).lower()  # 'true' or 'false'
+                elif isinstance(obj[key], list):
+                    # Special handling for lists
+                    for sub_obj in obj[key]:
+                        return_str += self.params_to_str(sub_obj, level + 1)
+                else:
+                    return_str += str(obj[key])
+            return return_str
+        else:
+            return str(obj)
+    
+    def send_request(self, method, params=None):
+        """Send API request to Crypto.com using official documented signing method"""
+        if params is None:
+            params = {}
+        
+        # IMPORTANT: Convert all numeric values to strings
+        # This is a requirement per documentation
+        def convert_numbers_to_strings(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(value, (int, float)):
+                        # Yuvarlamayı önlemek için direkt str() kullan
+                        # Bazı sayılar otomatik olarak 8.0 formatına dönüştürülüyor
+                        # Bunu engellemek için sayıya özel işlem yap
+                        if isinstance(value, float) and value == int(value):
+                            # Eğer float ama aslında tam sayı ise: 8.0 -> "8" değil, "8.0" olarak kalsın
+                            obj[key] = str(value)
+                        else:
+                            # Diğer durumlarda normal string dönüşümü
+                            obj[key] = str(value)
+                    elif isinstance(value, (dict, list)):
+                        convert_numbers_to_strings(value)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    if isinstance(item, (int, float)):
+                        # Yuvarlamayı önlemek için yine aynı mantık
+                        if isinstance(item, float) and item == int(item):
+                            obj[i] = str(item)
+                        else:
+                            obj[i] = str(item)
+                    elif isinstance(item, (dict, list)):
+                        convert_numbers_to_strings(item)
+            return obj
+        
+        # Convert all numbers to strings as required
+        params = convert_numbers_to_strings(params)
+            
+        # Generate request ID and nonce
+        request_id = int(time.time() * 1000)
+        nonce = request_id
+        
+        # Convert params to string using OFFICIAL algorithm
+        param_str = self.params_to_str(params)
+        
+        # Choose base URL based on method
+        # Account methods use v2 API, trading methods use v1 API
+        account_methods = [
+            "private/get-account-summary", 
+            "private/margin/get-account-summary",
+            "private/get-subaccount-balances",
+            "private/get-accounts"
+        ]
+        
+        public_methods = [
+            "public/get-ticker",
+            "public/get-instruments",
+            "public/get-book",
+            "public/get-trades",
+            "public/get-candlestick"
+        ]
+        
+        # Kontrol et: Bu bir public metod mu?
+        is_public_method = method in public_methods or method.startswith("public/")
+        
+        # Kontrol et: Bu bir account metodu mu?
+        is_account_method = any(method.startswith(acc_method) for acc_method in account_methods)
+        
+        # URL'yi belirle - Tüm API'ler artık v2 üzerinden çalışıyor 
+        base_url = "https://api.crypto.com/v2/"
+        logger.info(f"Using base URL: {base_url} for method: {method}")
+        
+        # Build signature payload EXACTLY as in documentation
+        # Format: method + id + api_key + params_string + nonce
+        sig_payload = method + str(request_id) + self.api_key + param_str + str(nonce)
+        
+        logger.info(f"Signature payload: {sig_payload}")
+        
+        # Generate signature
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            msg=bytes(sig_payload, 'utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        logger.info(f"Generated signature: {signature}")
+        
+        # Create request body - EXACTLY as in the documentation
+        request_body = {
+            "id": request_id,
+            "method": method,
+            "api_key": self.api_key,
+            "params": params,
+            "nonce": nonce,
+            "sig": signature
+        }
+        
+        # API endpoint - use the appropriate base URL
+        endpoint = f"{base_url}{method}"
+        
+        # Log detailed request information
+        logger.info("=" * 80)
+        logger.info("◆ API REQUEST DETAILS ◆")
+        logger.info(f"✦ FULL API URL: {endpoint}")
+        logger.info(f"✦ HTTP METHOD: POST")
+        logger.info(f"✦ REQUEST ID: {request_id}")
+        logger.info(f"✦ API METHOD: {method}")
+        logger.info(f"✦ PARAMS: {json.dumps(params, indent=2)}")
+        logger.info(f"✦ PARAM STRING FOR SIGNATURE: {param_str}")
+        logger.info(f"✦ SIGNATURE PAYLOAD: {sig_payload}")
+        logger.info(f"✦ SIGNATURE: {signature}")
+        logger.info(f"✦ FULL REQUEST: {json.dumps(request_body, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Send request
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=request_body,
+            timeout=30
+        )
+        
+        # Log response
+        response_data = {}
+        try:
+            response_data = response.json()
+        except:
+            logger.error(f"Failed to parse response as JSON. Raw response: {response.text}")
+            response_data = {"error": "Failed to parse JSON", "raw": response.text}
+        
+        logger.info("=" * 80)
+        logger.info("◆ API RESPONSE ◆")
+        logger.info(f"✦ STATUS CODE: {response.status_code}")
+        logger.info(f"✦ RESPONSE: {json.dumps(response_data, indent=2)}")
+        logger.info("=" * 80)
+        
+        return response_data
+    
+    def test_auth(self):
+        """Test authentication with the exchange API"""
+        try:
+            account_summary = self.get_account_summary()
+            return account_summary is not None
+        except Exception as e:
+            logger.error(f"Authentication test failed: {str(e)}")
+            return False
+    
+    def get_account_summary(self):
+        """Get account summary from the exchange"""
+        try:
+            method = "private/get-account-summary"
+            params = {}
+            
+            # Send request
+            response = self.send_request(method, params)
+            
+            if response.get("code") == 0:
+                logger.debug("Successfully fetched account summary")
+                return response.get("result")
+            else:
+                error_code = response.get("code")
+                error_msg = response.get("message", response.get("msg", "Unknown error"))
+                logger.error(f"API error: {error_code} - {error_msg}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_account_summary: {str(e)}")
+            return None
+    
+    def get_balance(self, currency="USDT"):
+        """Get balance for a specific currency"""
+        try:
+            account_summary = self.get_account_summary()
+            if not account_summary or "accounts" not in account_summary:
+                logger.error("Failed to get account summary")
+                return 0
+                
+            # Find the currency in accounts
+            for account in account_summary["accounts"]:
+                if account.get("currency") == currency:
+                    available = float(account.get("available", 0))
+                    logger.info(f"Available {currency} balance: {available}")
+                    return available
+                    
+            logger.warning(f"Currency {currency} not found in account")
+            return 0
+        except Exception as e:
+            logger.error(f"Error in get_balance: {str(e)}")
+            return 0
+    
+    def has_sufficient_balance(self, currency="USDT"):
+        """Check if there is sufficient balance for trading"""
+        balance = self.get_balance(currency)
+        sufficient = balance >= self.min_balance_required
+        
+        if sufficient:
+            logger.info(f"Sufficient balance: {balance} {currency}")
+        else:
+            logger.warning(f"Insufficient balance: {balance} {currency}, minimum required: {self.min_balance_required}")
+            
+        return sufficient
+    
+    def buy_coin(self, instrument_name, amount_usd=10):
+        """Buy coin with specified USD amount using market order"""
+        logger.info(f"Creating market buy order for {instrument_name} with ${amount_usd}")
+        
+        # IMPORTANT: Use the exact method format from documentation
+        method = "private/create-order"
+        
+        # Sabit URL kullanılması için doğrudan endpoint oluşturma
+        endpoint = "https://api.crypto.com/v2/private/create-order"
+        
+        # Generate request ID and nonce
+        request_id = int(time.time() * 1000)
+        nonce = request_id
+        
+        # Create order params - ensure all numbers are strings
+        params = {
+            "instrument_name": instrument_name,
+            "side": "BUY",
+            "type": "MARKET",
+            "notional": str(float(amount_usd))  # Convert to string as required
+        }
+        
+        # Convert params to string using OFFICIAL algorithm
+        param_str = self.params_to_str(params)
+        
+        # Build signature payload EXACTLY as in documentation
+        sig_payload = method + str(request_id) + self.api_key + param_str + str(nonce)
+        
+        logger.info(f"Signature payload: {sig_payload}")
+        
+        # Generate signature
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            msg=bytes(sig_payload, 'utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        logger.info(f"Generated signature: {signature}")
+        
+        # Create request body - EXACTLY as in the documentation
+        request_body = {
+            "id": request_id,
+            "method": method,
+            "api_key": self.api_key,
+            "params": params,
+            "nonce": nonce,
+            "sig": signature
+        }
+        
+        # Log detailed request information
+        logger.info("=" * 80)
+        logger.info("◆ API REQUEST DETAILS ◆")
+        logger.info(f"✦ FULL API URL: {endpoint}")
+        logger.info(f"✦ HTTP METHOD: POST")
+        logger.info(f"✦ REQUEST ID: {request_id}")
+        logger.info(f"✦ API METHOD: {method}")
+        logger.info(f"✦ PARAMS: {json.dumps(params, indent=2)}")
+        logger.info(f"✦ PARAM STRING FOR SIGNATURE: {param_str}")
+        logger.info(f"✦ SIGNATURE PAYLOAD: {sig_payload}")
+        logger.info(f"✦ SIGNATURE: {signature}")
+        logger.info(f"✦ FULL REQUEST: {json.dumps(request_body, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Send request
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=request_body,
+            timeout=30
+        )
+        
+        # Log response
+        response_data = {}
+        try:
+            response_data = response.json()
+        except:
+            logger.error(f"Failed to parse response as JSON. Raw response: {response.text}")
+            response_data = {"error": "Failed to parse JSON", "raw": response.text}
+        
+        logger.info("=" * 80)
+        logger.info("◆ API RESPONSE ◆")
+        logger.info(f"✦ STATUS CODE: {response.status_code}")
+        logger.info(f"✦ RESPONSE: {json.dumps(response_data, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Check response
+        if response_data.get("code") == 0:
+            order_id = None
+            
+            # Try to extract order ID
+            if "result" in response_data and "order_id" in response_data.get("result", {}):
+                order_id = response_data.get("result", {}).get("order_id")
+            
+            if order_id:
+                logger.info(f"Order successfully created! Order ID: {order_id}")
+                
+                # Get order details to obtain filled price and quantity
+                time.sleep(2)  # Wait a bit for the order to process
+                order_details = self.get_order_detail(order_id)
+                
+                if order_details:
+                    return {
+                        "order_id": order_id,
+                        "filled_price": order_details.get("filled_price"),
+                        "filled_quantity": order_details.get("filled_quantity"),
+                        "status": order_details.get("status")
+                    }
+                return {"order_id": order_id}
+            else:
+                logger.info(f"Order successful, but couldn't find order ID in response")
+                return {"success": True}
+        else:
+            error_code = response_data.get("code")
+            error_msg = response_data.get("message", response_data.get("msg", "Unknown error"))
+            logger.error(f"Failed to create order. Error {error_code}: {error_msg}")
+            logger.error(f"Full response: {json.dumps(response_data, indent=2)}")
+            return False
+    
+    def get_order_detail(self, order_id):
+        """Get order details including filled price and filled quantity"""
+        logger.info(f"Getting order details for order ID: {order_id}")
+        
+        method = "private/get-order-detail"
+        
+        # Güncellenmiş endpoint URL - v2 API
+        endpoint = "https://api.crypto.com/v2/private/get-order-detail"
+        
+        # Generate request ID and nonce
+        request_id = int(time.time() * 1000)
+        nonce = request_id
+        
+        params = {
+            "order_id": order_id
+        }
+        
+        # Convert params to string using OFFICIAL algorithm
+        param_str = self.params_to_str(params)
+        
+        # Build signature payload
+        sig_payload = method + str(request_id) + self.api_key + param_str + str(nonce)
+        
+        logger.info(f"Signature payload: {sig_payload}")
+        
+        # Generate signature
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            msg=bytes(sig_payload, 'utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        logger.info(f"Generated signature: {signature}")
+        
+        # Create request body
+        request_body = {
+            "id": request_id,
+            "method": method,
+            "api_key": self.api_key,
+            "params": params,
+            "nonce": nonce,
+            "sig": signature
+        }
+        
+        # Log detailed request information
+        logger.info("=" * 80)
+        logger.info("◆ API REQUEST DETAILS ◆")
+        logger.info(f"✦ FULL API URL: {endpoint}")
+        logger.info(f"✦ HTTP METHOD: POST")
+        logger.info(f"✦ REQUEST ID: {request_id}")
+        logger.info(f"✦ API METHOD: {method}")
+        logger.info(f"✦ PARAMS: {json.dumps(params, indent=2)}")
+        logger.info(f"✦ PARAM STRING FOR SIGNATURE: {param_str}")
+        logger.info(f"✦ SIGNATURE PAYLOAD: {sig_payload}")
+        logger.info(f"✦ SIGNATURE: {signature}")
+        logger.info(f"✦ FULL REQUEST: {json.dumps(request_body, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Send request
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=request_body,
+            timeout=30
+        )
+        
+        # Log response
+        try:
+            response_data = response.json()
+        except:
+            logger.error(f"Failed to parse response as JSON: {response.text}")
+            return None
+        
+        logger.info("=" * 80)
+        logger.info("◆ API RESPONSE ◆")
+        logger.info(f"✦ STATUS CODE: {response.status_code}")
+        logger.info(f"✦ RESPONSE: {json.dumps(response_data, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Check response
+        if response_data.get("code") == 0:
+            # Extract order details from response
+            order_info = response_data.get("result", {})
+            logger.info(f"Order details: {json.dumps(order_info, indent=2)}")
+            
+            # Extract filled price and quantity
+            status = order_info.get("status")
+            filled_price = order_info.get("avg_price")
+            filled_quantity = order_info.get("cumulative_quantity")
+            
+            logger.info(f"Order {order_id} status: {status}, filled price: {filled_price}, filled quantity: {filled_quantity}")
+            
+            return {
+                "status": status,
+                "filled_price": filled_price,
+                "filled_quantity": filled_quantity,
+                "order_info": order_info
+            }
+        else:
+            error_code = response_data.get("code")
+            error_msg = response_data.get("message", response_data.get("msg", "Unknown error"))
+            logger.error(f"Failed to get order details. Error {error_code}: {error_msg}")
+            return None
+    
+    def get_coin_balance(self, currency):
+        """Get balance for a specific coin currency"""
+        try:
+            account_summary = self.get_account_summary()
+            if not account_summary or "accounts" not in account_summary:
+                logger.error(f"Failed to get account summary for {currency}")
+                return 0
+                
+            # Find the currency in accounts
+            for account in account_summary["accounts"]:
+                if account.get("currency") == currency:
+                    available = float(account.get("available", 0))
+                    logger.info(f"Available {currency} balance: {available}")
+                    return available
+                    
+            logger.warning(f"Currency {currency} not found in account")
+            return 0
+        except Exception as e:
+            logger.error(f"Error in get_coin_balance for {currency}: {str(e)}")
+            return 0
+    
+    def sell_coin(self, instrument_name, quantity):
+        """Sell coin using market order with specified quantity"""
+        logger.info(f"Creating market sell order for {instrument_name}, quantity: {quantity}")
+        
+        # IMPORTANT: Parse the currency from instrument name
+        # For example, SUI_USDT => SUI
+        base_currency = instrument_name.split('_')[0]
+        
+        # Double-check the current available balance before selling
+        current_balance = self.get_coin_balance(base_currency)
+        logger.info(f"Double-checking {base_currency} balance before sell: {current_balance}")
+        
+        try:
+            # Coin bazında maksimum satış miktarları belirleyelim
+            max_sell_qty = {
+                'BTC': 0.1,        # BTC için maksimum 0.1 BTC'lik emir
+                'ETH': 1,          # ETH için maksimum 1 ETH'lik emir
+                'SUI': 100,        # SUI için maksimum 100 SUI'lik emir
+                'BONK': 100000,    # BONK için maksimum 100,000 BONK'luk emir
+                'SHIB': 100000,    # SHIB için maksimum 100,000 SHIB'lik emir
+                'PEPE': 100000,    # PEPE için maksimum 100,000 PEPE'lik emir
+                'FLOKI': 100000,   # FLOKI için maksimum 100,000 FLOKI'lik emir
+            }
+            
+            # Coin bazında format kurallarını belirleyelim
+            coin_formats = {
+                'BTC': {"precision": 8, "min_qty": 0.0001},
+                'ETH': {"precision": 4, "min_qty": 0.001},
+                'SUI': {"precision": 1, "min_qty": 0.1}, 
+                'BONK': {"precision": 0, "min_qty": 1},
+                'SHIB': {"precision": 0, "min_qty": 1},
+                'PEPE': {"precision": 0, "min_qty": 1},
+                'FLOKI': {"precision": 0, "min_qty": 1},
+            }
+            
+            # Varsayılan format kuralları
+            default_format = {"precision": 2, "min_qty": 0.01}
+            
+            # Bu coin için format kurallarını al
+            coin_format = coin_formats.get(base_currency.upper(), default_format)
+            precision = coin_format["precision"]
+            min_qty = coin_format["min_qty"]
+            
+            # Varsayılan maksimum satış miktarı
+            default_max_qty = 50
+            
+            # Bakiye kontrolü ve dönüşüm
+            try:
+                current_balance_float = float(current_balance)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert balance to float: {current_balance}")
+                current_balance_float = 0
+                
+            try:
+                quantity_float = float(quantity)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert quantity to float: {quantity}")
+                quantity_float = 0
+            
+            # If requested quantity is more than available, adjust
+            if quantity_float > current_balance_float:
+                logger.warning(f"Requested sell amount {quantity_float} > available balance {current_balance_float}")
+                # Use 95% of available balance for safety margin
+                quantity_float = current_balance_float * 0.95
+                logger.info(f"Adjusted sell quantity to 95% of available: {quantity_float}")
+            else:
+                # YENİ: Her durumda %95'ini sat
+                original_quantity = quantity_float
+                quantity_float = quantity_float * 0.95
+                logger.info(f"Using 95% of requested quantity: {original_quantity} -> {quantity_float}")
+            
+            # Bu coin için maksimum satış miktarını al
+            coin_max_qty = max_sell_qty.get(base_currency.upper(), default_max_qty)
+            
+            # NOT: Artık burada parçalı satış kontrolünü yapmıyoruz
+            # Önce tam miktar ile satış deneyeceğiz, hata durumunda parçalı satış yapacağız
+            
+            # Python'un yuvarlama yapma davranışını engellemek için ham değeri string'e çeviriyoruz
+            # Hiçbir şekilde yuvarlama yapmadan tam değeri kullanacağız
+            formatted_quantity = str(quantity_float)
+            
+            # Coinlere özel minimum değer kontrolü
+            if base_currency.upper() == 'BTC':
+                if quantity_float < min_qty:
+                    logger.warning(f"BTC quantity {quantity_float} too small, setting to minimum {min_qty}")
+                    formatted_quantity = str(min_qty)
+                logger.info(f"Using exact BTC quantity without any rounding: {formatted_quantity}")
+                    
+            elif base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                # Düşük değerli yüksek miktarlı coinler için
+                if quantity_float > 1000000:
+                    # Çok yüksek miktarlar için işlem limitlerini aşmamak adına küçült
+                    logger.warning(f"Very high quantity for {base_currency}: {quantity_float}, reducing")
+                    formatted_quantity = str(1000000)  # Maksimum 1 milyon coin sat
+                logger.info(f"Using exact {base_currency} quantity without any rounding: {formatted_quantity}")
+                
+            elif base_currency.upper() == 'SUI':
+                # SUI için minimum değer kontrolü
+                if quantity_float < min_qty:
+                    logger.warning(f"SUI quantity {quantity_float} too small, setting to minimum {min_qty}")
+                    formatted_quantity = str(min_qty)
+                logger.info(f"Using exact SUI quantity without any rounding: {formatted_quantity}")
+                
+            else:
+                # Diğer tüm coinler için minimum değer kontrolü
+                if quantity_float < min_qty:
+                    logger.warning(f"Quantity {quantity_float} too small for {base_currency}, setting to minimum {min_qty}")
+                    formatted_quantity = str(min_qty)
+                logger.info(f"Using exact {base_currency} quantity without any rounding: {formatted_quantity}")
+            
+            logger.info(f"Final exact quantity for {base_currency}: {formatted_quantity}")
+            
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error processing balance or quantity: {str(e)}")
+            # Varsayılan format
+            formatted_quantity = "0.001" if base_currency.upper() == 'BTC' else "1"
+        
+        # IMPORTANT: Use the exact method format from documentation
+        method = "private/create-order"
+        
+        # Sabit URL kullanılması için doğrudan endpoint oluşturma - V2 API
+        endpoint = "https://api.crypto.com/v2/private/create-order"
+        
+        # Generate request ID and nonce
+        request_id = int(time.time() * 1000)
+        nonce = request_id
+        
+        # Create order params - EXACTLY as in working example
+        params = {
+            "instrument_name": instrument_name,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": formatted_quantity
+        }
+        
+        # Ekstra güvenlik: Tam sayı gibi görünen float'lar için özel işlem yapalım
+        # Örneğin 8.0 gibi sayılar otomatik olarak yuvarlanabilir
+        if formatted_quantity.endswith('.0'):
+            logger.info(f"Quantity ends with .0, keeping the exact format: {formatted_quantity}")
+        
+        # Convert params to string using OFFICIAL algorithm
+        param_str = self.params_to_str(params)
+        
+        # Build signature payload EXACTLY as in documentation
+        sig_payload = method + str(request_id) + self.api_key + param_str + str(nonce)
+        
+        logger.info(f"Signature payload: {sig_payload}")
+        
+        # Generate signature
+        signature = hmac.new(
+            bytes(self.api_secret, 'utf-8'),
+            msg=bytes(sig_payload, 'utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        logger.info(f"Generated signature: {signature}")
+        
+        # JSON dönüşümünde float sayıları yuvarlamayı engellemek için custom encoder kullanabiliriz
+        class NoFloatRoundingEncoder(json.JSONEncoder):
+            def encode(self, obj):
+                if isinstance(obj, float):
+                    # Float değerleri string'e çevirerek koruyor
+                    return str(obj)
+                return super(NoFloatRoundingEncoder, self).encode(obj)
+            
+            def iterencode(self, obj, _one_shot=False):
+                if isinstance(obj, float):
+                    return str(obj)
+                return super(NoFloatRoundingEncoder, self).iterencode(obj, _one_shot)
+        
+        # Create request body - EXACTLY as in the documentation
+        # Create request body - EXACTLY as in the documentation
+        request_body = {
+            "id": request_id,
+            "method": method,
+            "api_key": self.api_key,
+            "params": params,
+            "nonce": nonce,
+            "sig": signature
+        }
+        
+        logger.info(f"Sending SELL order with params: {json.dumps(params)}")
+        
+        # Log detailed request information
+        logger.info("=" * 80)
+        logger.info("◆ API REQUEST DETAILS ◆")
+        logger.info(f"✦ FULL API URL: {endpoint}")
+        logger.info(f"✦ HTTP METHOD: POST")
+        logger.info(f"✦ REQUEST ID: {request_id}")
+        logger.info(f"✦ API METHOD: {method}")
+        logger.info(f"✦ PARAMS: {json.dumps(params, indent=2)}")
+        logger.info(f"✦ PARAM STRING FOR SIGNATURE: {param_str}")
+        logger.info(f"✦ SIGNATURE PAYLOAD: {sig_payload}")
+        logger.info(f"✦ SIGNATURE: {signature}")
+        logger.info(f"✦ FULL REQUEST: {json.dumps(request_body, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Send request
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=request_body,
+            timeout=30
+        )
+        
+        # Log response
+        response_data = {}
+        try:
+            response_data = response.json()
+        except:
+            logger.error(f"Failed to parse response as JSON: {response.text}")
+            response_data = {"error": "Failed to parse JSON", "raw": response.text}
+        
+        logger.info("=" * 80)
+        logger.info("◆ API RESPONSE ◆")
+        logger.info(f"✦ STATUS CODE: {response.status_code}")
+        logger.info(f"✦ RESPONSE: {json.dumps(response_data, indent=2)}")
+        logger.info("=" * 80)
+        
+        # Check response
+        if response_data.get("code") == 0:
+            order_id = None
+            
+            # Try to extract order ID
+            if "result" in response_data and "order_id" in response_data.get("result", {}):
+                order_id = response_data.get("result", {}).get("order_id")
+            
+            if order_id:
+                logger.info(f"Sell order successfully created! Order ID: {order_id}")
+                return order_id
+            else:
+                logger.info(f"Sell order successful, but couldn't find order ID in response")
+                return True
+        else:
+            error_code = response_data.get("code")
+            error_msg = response_data.get("message", response_data.get("msg", "Unknown error"))
+            logger.error(f"Failed to create sell order. Error {error_code}: {error_msg}")
+            logger.error(f"Full response: {json.dumps(response_data, indent=2)}")
+            
+            # Hata INVALID_ORDERQTY ise veya miktar/emir ile ilgili bir hata ise parçalı satış dene
+            if (error_code == 213 and "INVALID_ORDERQTY" in str(error_msg).upper()) or "ORDER" in str(error_msg).upper() or "QUANTITY" in str(error_msg).upper():
+                logger.warning(f"Order quantity error detected. Trying to sell in parts...")
+                
+                # Satış miktarı maksimum miktar sınırını aşıyorsa bölmek mantıklı olabilir
+                if base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI'] and quantity_float > 100000:
+                    logger.info(f"Quantity {quantity_float} is large for {base_currency}, will sell in multiple parts")
+                    return self._sell_in_parts(instrument_name, quantity_float, coin_max_qty)
+                elif base_currency.upper() not in ['BONK', 'SHIB', 'PEPE', 'FLOKI'] and quantity_float > coin_max_qty:
+                    logger.info(f"Quantity {quantity_float} is large for {base_currency}, will sell in multiple parts")
+                    return self._sell_in_parts(instrument_name, quantity_float, coin_max_qty)
+                else:
+                    # Miktar çok büyük değilse de varsayılan parça büyüklüğünü kullanarak parçalı satışı dene
+                    logger.info(f"Trying to sell {quantity_float} {base_currency} in smaller parts")
+                    default_part_size = coin_max_qty / 2 if coin_max_qty > 10 else 5  # Varsayılan parça boyutu
+                    return self._sell_in_parts(instrument_name, quantity_float, default_part_size)
+            
+            # INVALID_ORDERQTY ise farklı miktarları deneyelim
+            if error_code == 213 and "INVALID_ORDERQTY" in str(error_msg).upper():
+                logger.warning("INVALID_ORDERQTY error. Trying different quantity values...")
+                
+                # Her coin tipi için farklı alternatif miktarlar deneyelim
+                retry_quantities = []
+                
+                if base_currency.upper() == 'BTC':
+                    # BTC için alternatif miktarlar
+                    retry_quantities = [
+                        "0.001",  # Minimum miktar
+                        "0.01",   # Daha güvenli miktar
+                        f"{float(current_balance) * 0.5:.8f}",  # Mevcut bakiyenin %50'si
+                        f"{float(current_balance) * 0.25:.8f}"  # Mevcut bakiyenin %25'i
+                    ]
+                elif base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                    # Yüksek hacimli coinler için alternatif miktarlar
+                    retry_quantities = [
+                        "1000",
+                        "10000",
+                        "100000",
+                        str(min(int(float(current_balance) * 0.1), 50000))  # Bakiyenin %10'u veya en fazla 50000
+                    ]
+                elif base_currency.upper() == 'SUI':
+                    # SUI için alternatif miktarlar
+                    available_balance = float(current_balance)
+                    retry_quantities = [
+                        "1.0",
+                        "5.0",
+                        "10.0",
+                        f"{max(1.0, available_balance * 0.9):.1f}",  # Bakiyenin %90'ı (en az 1)
+                        f"{max(1.0, available_balance * 0.5):.1f}",  # Bakiyenin %50'si (en az 1)
+                        f"{max(1.0, available_balance * 0.25):.1f}"  # Bakiyenin %25'i (en az 1)
+                    ]
+                else:
+                    # Diğer coinler için
+                    retry_quantities = [
+                        "1.0",
+                        "5.0",
+                        "10.0",
+                        f"{float(current_balance) * 0.5:.1f}"  # Bakiyenin %50'si
+                    ]
+                
+                for i, retry_qty in enumerate(retry_quantities):
+                    logger.info(f"Trying quantity alternative {i+1}: {retry_qty}")
+                    
+                    # Create new request for retry
+                    new_request_id = int(time.time() * 1000)
+                    new_nonce = new_request_id
+                    
+                    new_params = {
+                        "instrument_name": instrument_name,
+                        "side": "SELL",
+                        "type": "MARKET",
+                        "quantity": retry_qty
+                    }
+                    
+                    # Convert params to string
+                    new_param_str = self.params_to_str(new_params)
+                    
+                    # Build signature payload
+                    new_sig_payload = method + str(new_request_id) + self.api_key + new_param_str + str(new_nonce)
+                    
+                    # Generate signature
+                    new_signature = hmac.new(
+                        bytes(self.api_secret, 'utf-8'),
+                        msg=bytes(new_sig_payload, 'utf-8'),
+                        digestmod=hashlib.sha256
+                    ).hexdigest()
+                    
+                    # Create request body
+                    new_request_body = {
+                        "id": new_request_id,
+                        "method": method,
+                        "api_key": self.api_key,
+                        "params": new_params,
+                        "nonce": new_nonce,
+                        "sig": new_signature
+                    }
+                    
+                    # Send retry request directly to endpoint
+                    retry_response = requests.post(
+                        endpoint,
+                        headers=headers,
+                        json=new_request_body,
+                        timeout=30
+                    )
+                    
+                    try:
+                        retry_response_data = retry_response.json()
+                    except:
+                        logger.error(f"Failed to parse retry response as JSON: {retry_response.text}")
+                        continue
+                    
+                    if retry_response_data.get("code") == 0:
+                        retry_order_id = retry_response_data.get("result", {}).get("order_id")
+                        if retry_order_id:
+                            logger.info(f"Success with quantity {retry_qty}! Order ID: {retry_order_id}")
+                            return retry_order_id
+                        return True
+                    else:
+                        retry_error = retry_response_data.get("message", retry_response_data.get("msg", "Unknown error"))
+                        logger.error(f"Quantity alternative {i+1} failed. Error: {retry_error}")
+                
+                logger.error("All quantity alternatives failed. Please check API documentation for valid quantity ranges.")
+            
+            return False
+    
+    def _sell_in_parts(self, instrument_name, total_quantity, part_size):
+        """
+        Büyük miktarlı satış emirlerini parçalara bölerek satar
+        
+        Args:
+            instrument_name (str): Satılacak coin çifti (örn: BONK_USDT)
+            total_quantity (float): Toplam satış miktarı
+            part_size (float): Her bir parçada satılacak maksimum miktar
+            
+        Returns:
+            bool: Tüm satışlar başarılı ise True, aksi halde False
+        """
+        base_currency = instrument_name.split('_')[0]
+        logger.info(f"Breaking large sell order for {instrument_name} into smaller parts")
+        logger.info(f"Total quantity: {total_quantity}, Part size: {part_size}")
+        
+        # YENİ: Total quantity'nin %95'ini hesapla
+        total_quantity = total_quantity * 0.95
+        logger.info(f"Using 95% of total quantity for selling in parts: {total_quantity}")
+        
+        # Kaç parçaya bölüneceğini hesapla
+        num_parts = int(total_quantity / part_size) + (1 if total_quantity % part_size > 0 else 0)
+        logger.info(f"Will sell in {num_parts} parts")
+        
+        successful_parts = 0
+        successful_quantity = 0
+        
+        for i in range(num_parts):
+            # Son parça için kalan miktarı hesapla
+            if i == num_parts - 1:
+                part_quantity = total_quantity - (i * part_size)
+            else:
+                part_quantity = part_size
+                
+            # Miktarı coin tipine göre formatla
+            if base_currency.upper() == 'BTC':
+                formatted_quantity = f"{part_quantity:.8f}"
+                # Sondaki sıfırları temizle
+                formatted_quantity = formatted_quantity.rstrip('0').rstrip('.') if '.' in formatted_quantity else formatted_quantity
+                if '.' not in formatted_quantity:
+                    formatted_quantity += '.0'
+            elif base_currency.upper() == 'SUI':
+                # SUI için tam olarak 1 ondalık basamaklı format
+                formatted_quantity = f"{part_quantity:.1f}"
+                # API için gerekli format: Ondalık basamak korunmalı
+            elif base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                formatted_quantity = str(int(part_quantity))
+            else:
+                formatted_quantity = f"{part_quantity:.1f}"
+                
+            logger.info(f"Selling part {i+1}/{num_parts}: {formatted_quantity} {base_currency}")
+            
+            # Satış emrini gönder
+            method = "private/create-order"
+            params = {
+                "instrument_name": instrument_name,
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": formatted_quantity
+            }
+            
+            logger.info(f"Sending partial SELL order with params: {json.dumps(params)}")
+            response = self.send_request(method, params)
+            
+            if response.get("code") == 0:
+                # Başarılı satış
+                order_id = response.get("result", {}).get("order_id")
+                logger.info(f"Part {i+1} sell successful! Order ID: {order_id}")
+                
+                # İşlemin tamamlanmasını bekle
+                if order_id:
+                    is_filled = self.monitor_order(order_id, check_interval=5, max_checks=12)
+                    if is_filled:
+                        logger.info(f"Part {i+1} order filled successfully")
+                        successful_parts += 1
+                        successful_quantity += part_quantity
+                    else:
+                        logger.warning(f"Part {i+1} order not filled in expected time")
+                else:
+                    # Order ID yok ama başarılı kod döndü
+                    successful_parts += 1
+                    successful_quantity += part_quantity
+                    
+                # Satışlar arası kısa bir bekleme ekle (rate limiting için)
+                time.sleep(2)
+            else:
+                # Satış başarısız
+                error_code = response.get("code")
+                error_msg = response.get("message", response.get("msg", "Unknown error"))
+                logger.error(f"Failed to sell part {i+1}. Error {error_code}: {error_msg}")
+                
+                # Alternatif miktarları dene
+                if error_code == 213:  # INVALID_ORDERQTY
+                    alternative_quantities = []
+                    
+                    if base_currency.upper() == 'BTC':
+                        # BTC için alternatif miktarlar
+                        alternative_quantities = [
+                            "0.001", "0.01", f"{part_quantity * 0.5:.8f}"
+                        ]
+                    elif base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                        # Düşük değerli coinler için alternatif miktarlar
+                        alternative_quantities = [
+                            "1000", "10000", "50000"
+                        ]
+                    else:
+                        # Diğer coinler için alternatif miktarlar
+                        alternative_quantities = [
+                            "1.0", "5.0", f"{part_quantity * 0.5:.1f}"
+                        ]
+                        
+                    # Alternatifleri dene
+                    alt_success = False
+                    for j, alt_qty in enumerate(alternative_quantities):
+                        logger.info(f"Trying alternative quantity for part {i+1}: {alt_qty}")
+                        params["quantity"] = alt_qty
+                        alt_response = self.send_request(method, params)
+                        
+                        if alt_response.get("code") == 0:
+                            alt_order_id = alt_response.get("result", {}).get("order_id")
+                            logger.info(f"Alternative quantity {alt_qty} successful! Order ID: {alt_order_id}")
+                            successful_parts += 1
+                            successful_quantity += float(alt_qty.replace(',', '.'))
+                            alt_success = True
+                            break
+                    
+                    if not alt_success:
+                        logger.error(f"All alternative quantities failed for part {i+1}")
+                
+        # Tüm parçaların satış sonucunu değerlendir
+        logger.info(f"Completed selling {successful_quantity}/{total_quantity} {base_currency} in {successful_parts}/{num_parts} parts")
+        
+        if successful_parts == 0:
+            logger.error(f"No parts were sold successfully")
+            return False
+        elif successful_parts < num_parts:
+            logger.warning(f"Only {successful_parts} out of {num_parts} parts were sold successfully")
+            return True  # En azından bir kısmı satıldı
+        else:
+            logger.info(f"All {num_parts} parts sold successfully")
+            return True
+    
+    def get_order_status(self, order_id):
+        """Get the status of an order"""
+        try:
+            method = "private/get-order-detail"
+            params = {
+                "order_id": order_id
+            }
+            
+            # Send request
+            response = self.send_request(method, params)
+            
+            if response.get("code") == 0:
+                # Doğrudan result içerisinden status'u al
+                status = response.get("result", {}).get("status")
+                logger.debug(f"Order {order_id} status: {status}")
+                return status
+            else:
+                error_code = response.get("code")
+                error_msg = response.get("message", response.get("msg", "Unknown error"))
+                logger.error(f"API error: {error_code} - {error_msg}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_order_status: {str(e)}")
+            return None
+    
+    def monitor_order(self, order_id, check_interval=5, max_checks=60):
+        """Monitor an order until it's filled or cancelled"""
+        checks = 0
+        while checks < max_checks:
+            status = self.get_order_status(order_id)
+            
+            if status == "FILLED":
+                logger.info(f"Order {order_id} is filled")
+                return True
+            elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                logger.warning(f"Order {order_id} is {status}")
+                return False
+            
+            logger.debug(f"Order {order_id} status: {status}, checking again in {check_interval} seconds")
+            time.sleep(check_interval)
+            checks += 1
+            
+        logger.warning(f"Monitoring timed out for order {order_id}")
+        return False
+    
+    def get_current_price(self, instrument_name):
+        """Get current price for a symbol from the API"""
+        try:
+            # TradingView API kullanarak ticker verisi al (strategy.py'dan esinlenerek)
+            # Bu daha güvenilir bir yaklaşım olacaktır
+            endpoint = "https://api.crypto.com/v2/public/get-ticker"
+            
+            request_id = int(time.time() * 1000)
+            
+            # Create request body
+            request_body = {
+                "id": request_id,
+                "method": "public/get-ticker",
+                "params": {
+                    "instrument_name": instrument_name
+                }
+            }
+            
+            # Send request
+            headers = {'Content-Type': 'application/json'}
+            logger.info(f"Sending GET ticker request to: {endpoint}")
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=request_body,
+                timeout=30
+            )
+            
+            # Parse response
+            try:
+                response_data = response.json()
+                logger.debug(f"Ticker response: {json.dumps(response_data, indent=2)}")
+            except:
+                logger.error(f"Failed to parse response as JSON: {response.text}")
+                return None
+            
+            if response_data.get("code") == 0:
+                result = response_data.get("result", {})
+                data = result.get("data", [])
+                
+                if data:
+                    for ticker in data:
+                        if ticker.get("i") == instrument_name:
+                            # 'a' is the ask price
+                            latest_price = float(ticker.get("a", 0))
+                            logger.info(f"Current price for {instrument_name}: {latest_price}")
+                            return latest_price
+                    
+                    logger.warning(f"No matching ticker found for {instrument_name}")
+                else:
+                    logger.warning(f"No ticker data found for {instrument_name}")
+            else:
+                error_code = response_data.get("code")
+                error_msg = response_data.get("message", response_data.get("msg", "Unknown error"))
+                logger.error(f"API error: {error_code} - {error_msg}")
+                
+                # Crypto.com özel bir durum: Farklı bir endpoint denemeyi deneyelim
+                try:
+                    return self._get_price_alternative(instrument_name)
+                except Exception as e:
+                    logger.error(f"Alternative price fetch failed: {str(e)}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current price for {instrument_name}: {str(e)}")
+            
+            # Hata durumunda alternatif endpoint'i dene
+            try:
+                return self._get_price_alternative(instrument_name)
+            except Exception as e2:
+                logger.error(f"Alternative price fetch also failed: {str(e2)}")
+                
+            return None
+            
+    def _get_price_alternative(self, instrument_name):
+        """Alternative price fetching method using a different endpoint"""
+        try:
+            url = f"https://api.crypto.com/v2/public/get-ticker"
+            
+            # Bu sefer daha basit bir istek gönderelim
+            params = {
+                "instrument_name": instrument_name
+            }
+            
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            
+            # JSON body hazırla
+            data = {
+                "id": int(time.time() * 1000),
+                "method": "public/get-ticker",
+                "params": params
+            }
+            
+            # Direkt POST isteği
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            
+            if response.status_code == 200:
+                resp_data = response.json()
+                if resp_data.get("code") == 0:
+                    result = resp_data.get("result", {})
+                    instruments = result.get("data", [])
+                    
+                    # Find the matching instrument
+                    for instr in instruments:
+                        if instr.get("i") == instrument_name:
+                            price = float(instr.get("a", 0))  # Ask price
+                            logger.info(f"Alternative method price for {instrument_name}: {price}")
+                            return price
+                            
+            logger.warning(f"Alternative price fetch failed for {instrument_name}")
+            return None
+        except Exception as e:
+            logger.error(f"Error in alternative price fetch: {str(e)}")
+            return None
+
+class GoogleSheetTradeManager:
+    """Class to manage trades based on Google Sheet data"""
+    
+    def __init__(self):
+        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self.credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+        self.worksheet_name = os.getenv("GOOGLE_WORKSHEET_NAME", "Trading")
+        self.exchange_api = CryptoExchangeAPI()
+        self.check_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "5"))  # Default 5 seconds
+        self.batch_size = int(os.getenv("BATCH_SIZE", "5"))  # Process in batches
+        self.active_positions = {}  # Track active positions
+        
+        # Connect to Google Sheets
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        
+        credentials = ServiceAccountCredentials.from_json_keyfile_name(
+            self.credentials_file, scope
+        )
+        
+        self.client = gspread.authorize(credentials)
+        self.sheet = self.client.open_by_key(self.sheet_id)
+        try:
+            self.worksheet = self.sheet.worksheet(self.worksheet_name)
+        except:
+            self.worksheet = self.sheet.get_worksheet(0)
+        
+        logger.info(f"Connected to Google Sheet: {self.sheet.title}")
+        
+        # Ensure order_id column exists
+        self.ensure_order_id_column_exists()
+    
+    def format_price_eu(self, value):
+        """
+        Değeri Avrupa formatında biçimlendir (ondalık ayırıcı olarak virgül kullan)
+        
+        Args:
+            value: Biçimlendirilecek sayısal değer
+            
+        Returns:
+            str: Avrupa formatında biçimlendirilmiş değer (örn: "3,14159")
+        """
+        try:
+            # Float değeri 5 ondalık basamak ile biçimlendir ve noktaları virgüle çevir
+            return "{:.5f}".format(float(value)).replace('.', ',')
+        except Exception as e:
+            logger.error(f"Error formatting price to EU format: {str(e)}")
+            return str(value)
+
+    def ensure_order_id_column_exists(self):
+        """Ensure that the order_id column exists in the worksheet"""
+        try:
+            # Get all column headers
+            headers = self.worksheet.row_values(1)
+            
+            # Check if 'order_id' exists
+            if 'order_id' not in headers:
+                # Find the last column
+                last_col = len(headers) + 1
+                
+                # Add the header
+                self.worksheet.update_cell(1, last_col, 'order_id')
+                logger.info("Added 'order_id' column to worksheet")
+            else:
+                logger.info("'order_id' column already exists in worksheet")
+        except Exception as e:
+            logger.error(f"Error ensuring order_id column exists: {str(e)}")
+    
+    def get_trade_signals(self):
+        """Get coins marked for trading from Google Sheet"""
+        try:
+            # Get all records from the sheet
+            all_records = self.worksheet.get_all_records()
+            
+            if not all_records:
+                logger.error("No data found in the sheet")
+                return []
+            
+            # Find rows with actionable signals in 'Buy Signal' column
+            trade_signals = []
+            for idx, row in enumerate(all_records):
+                # Check if TRADE is YES
+                trade_value = row.get('TRADE', '').upper()
+                is_active = trade_value in ['YES', 'Y', 'TRUE', '1']
+                buy_signal = row.get('Buy Signal', '').upper()
+                tradable = row.get('Tradable', 'YES').upper() == 'YES'
+                
+                # Skip if not active or not tradable
+                if not is_active or not tradable:
+                    continue
+                
+                symbol = row.get('Coin', '')
+                if not symbol:
+                    continue
+                    
+                # Format for API: append _USDT if not already in pair format
+                if '_' not in symbol and '/' not in symbol:
+                    formatted_pair = f"{symbol}_USDT"
+                elif '/' in symbol:
+                    formatted_pair = symbol.replace('/', '_')
+                else:
+                    formatted_pair = symbol
+                
+                # Process based on signal type (BUY or SELL)
+                if buy_signal == 'BUY':
+                    # Get additional data for trade - handle European number format (comma as decimal separator)
+                    try:
+                        # Get real-time price from API
+                        api_price = self.exchange_api.get_current_price(formatted_pair)
+                        
+                        # If API price is available, use it, otherwise fall back to sheet price
+                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not sheet_price_str or sheet_price_str.strip() == '':
+                            sheet_price_str = '0'
+                            
+                        if api_price is not None:
+                            last_price = api_price
+                            logger.info(f"Using real-time API price for {symbol}: {last_price}")
+                        else:
+                            # Çok düşük değerli coinler için fiyat düzeltmesi (örn: BONK)
+                            try:
+                                test_float = float(sheet_price_str)
+                                # Eğer fiyat çok yüksek görünüyorsa ve coin adı düşük değerli bir coin ise düzelt
+                                if test_float > 1 and symbol.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                                    # Bu muhtemelen yanlış bir format - örn: "0,000123" -> "123" olmuş
+                                    # Doğru formata getir - muhtemelen çok küçük bir değer olmalı
+                                    decimal_count = len(sheet_price_str)
+                                    corrected_price = float(sheet_price_str) / (10 ** decimal_count)
+                                    logger.warning(f"Correcting abnormal price for {symbol}: {test_float} -> {corrected_price}")
+                                    last_price = corrected_price
+                                else:
+                                    last_price = test_float
+                            except ValueError:
+                                # Float dönüşümü yapılamazsa varsayılan değeri kullan
+                                last_price = float(sheet_price_str)
+                            
+                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
+                        
+                        # Get Resistance Up and Resistance Down values - properly handle European format
+                        resistance_up_str = str(row.get('Resistance Up', '0')).replace(',', '.')
+                        resistance_down_str = str(row.get('Resistance Down', '0')).replace(',', '.')
+                        
+                        if not resistance_up_str or resistance_up_str.strip() == '':
+                            resistance_up_str = '0'
+                        if not resistance_down_str or resistance_down_str.strip() == '':
+                            resistance_down_str = '0'
+                            
+                        # Convert to float
+                        resistance_up = float(resistance_up_str)
+                        resistance_down = float(resistance_down_str)
+                        
+                        # Always calculate Take Profit as 5% below Resistance Up
+                        # If resistance up is zero or invalid, use 20% above last price
+                        if resistance_up > 0:
+                            take_profit = resistance_up * 0.95
+                            logger.info(f"Calculated Take Profit for {symbol} based on Resistance Up: {take_profit}")
+                        else:
+                            take_profit = last_price * 1.20
+                            logger.info(f"Invalid Resistance Up for {symbol}, using default Take Profit: {take_profit}")
+                            
+                        # Always calculate Stop Loss as 5% below Resistance Down (Support)
+                        # If resistance down is zero or invalid, use 10% below last price
+                        if resistance_down > 0:
+                            stop_loss = resistance_down * 0.95
+                            logger.info(f"Calculated Stop Loss for {symbol} based on Resistance Down: {stop_loss}")
+                        else:
+                            stop_loss = last_price * 0.90
+                            logger.info(f"Invalid Resistance Down for {symbol}, using default Stop Loss: {stop_loss}")
+                        
+                        # Get buy target if available (or use last price)
+                        buy_target_str = str(row.get('Buy Target', '0')).replace(',', '.')
+                        if not buy_target_str or buy_target_str.strip() == '':
+                            buy_target = last_price
+                        else:
+                            buy_target = float(buy_target_str)
+                        
+                        # Log parsed values for debugging
+                        logger.debug(f"Parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
+                                    f"take_profit={take_profit}, stop_loss={stop_loss}, " +
+                                    f"resistance_up={resistance_up}, resistance_down={resistance_down}")
+                    except ValueError as e:
+                        logger.error(f"Error parsing number values for {symbol}: {str(e)}")
+                        continue
+                    
+                    trade_signals.append({
+                        'symbol': formatted_pair,
+                        'original_symbol': symbol,
+                        'row_index': idx + 2,  # +2 for header and 1-indexing
+                        'take_profit': take_profit,
+                        'stop_loss': stop_loss,
+                        'last_price': last_price,
+                        'buy_target': buy_target,
+                        'action': "BUY"
+                    })
+                elif buy_signal == 'SELL':
+                    # Get the order_id from the sheet to sell the correct position
+                    order_id = row.get('order_id', '')
+                    
+                    # For SELL signals, also get real-time price
+                    try:
+                        # Get real-time price from API
+                        api_price = self.exchange_api.get_current_price(formatted_pair)
+                        
+                        # If API price is available, use it, otherwise fall back to sheet price
+                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
+                        if not sheet_price_str or sheet_price_str.strip() == '':
+                            sheet_price_str = '0'
+                            
+                        if api_price is not None:
+                            last_price = api_price
+                            logger.info(f"Using real-time API price for SELL signal {symbol}: {last_price}")
+                        else:
+                            # Çok düşük değerli coinler için fiyat düzeltmesi (örn: BONK)
+                            try:
+                                test_float = float(sheet_price_str)
+                                # Eğer fiyat çok yüksek görünüyorsa ve coin adı düşük değerli bir coin ise düzelt
+                                if test_float > 1 and symbol.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                                    # Bu muhtemelen yanlış bir format - örn: "0,000123" -> "123" olmuş
+                                    # Doğru formata getir - muhtemelen çok küçük bir değer olmalı
+                                    decimal_count = len(sheet_price_str)
+                                    corrected_price = float(sheet_price_str) / (10 ** decimal_count)
+                                    logger.warning(f"Correcting abnormal price for {symbol}: {test_float} -> {corrected_price}")
+                                    last_price = corrected_price
+                                else:
+                                    last_price = test_float
+                            except ValueError:
+                                # Float dönüşümü yapılamazsa varsayılan değeri kullan
+                                last_price = float(sheet_price_str)
+                            
+                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
+                            
+                        logger.debug(f"SELL signal for {symbol} at price {last_price}")
+                    except ValueError as e:
+                        logger.error(f"Error parsing price for SELL signal {symbol}: {str(e)}")
+                        continue
+                    
+                    trade_signals.append({
+                        'symbol': formatted_pair,
+                        'original_symbol': symbol,
+                        'row_index': idx + 2,
+                        'last_price': last_price,
+                        'action': "SELL",
+                        'order_id': order_id
+                    })
+            
+            logger.info(f"Found {len(trade_signals)} trade signals")
+            return trade_signals
+                
+        except Exception as e:
+            logger.error(f"Error getting trade signals: {str(e)}")
+            return [] 
+
+    def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None):
+        """Update trade status in Google Sheet"""
+        try:
+            # Update Order Placed? (column H)
+            self.worksheet.update_cell(row_index, 8, status)
+            logger.info(f"Updated status to {status} for row {row_index}")
+            
+            # Set Tradable to NO when order is placed (column AG - after column AF, position 33)
+            if status == "ORDER_PLACED":
+                # Alım veya satım işlemi için farklı davranış
+                # Eğer satış işlemi ise Sold? kolonunu YES yap
+                # Bunu anlamak için Sold? kolonunu (column M) kontrol edelim
+                
+                try:
+                    current_sold_status = self.worksheet.cell(row_index, 13).value
+                    # Eğer satış işlemiyse ve sell_price mevcutsa
+                    if sell_price is not None:
+                        # Bu bir satış işlemi
+                        logger.info(f"This is a SELL operation for row {row_index}")
+                        
+                        # Update Sold? (column M) to YES
+                        self.worksheet.update_cell(row_index, 13, "YES")
+                        logger.info(f"Set Sold? to YES for row {row_index}")
+                        
+                        if sell_price:
+                            # Update Sell Price (column N) - using EU format
+                            formatted_price = self.format_price_eu(sell_price)
+                            self.worksheet.update_cell(row_index, 14, formatted_price)
+                            logger.info(f"Set Sell Price to {formatted_price}")
+                        
+                        if quantity:
+                            # Update Sell Quantity (column O) - using EU format
+                            formatted_quantity = self.format_price_eu(quantity)
+                            self.worksheet.update_cell(row_index, 15, formatted_quantity)
+                            logger.info(f"Set Sell Quantity to {formatted_quantity}")
+                        
+                        # Update Sold Date (column P)
+                        sold_date = sell_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.worksheet.update_cell(row_index, 16, sold_date)
+                        logger.info(f"Set Sold Date to {sold_date}")
+                        
+                        # Set Tradable back to YES (column AG - after column AF, position 33)
+                        self.worksheet.update_cell(row_index, 33, "YES")
+                        logger.info(f"Set Tradable back to YES")
+                        
+                        # Set Buy Signal to WAIT (column E) instead of clearing it
+                        self.worksheet.update_cell(row_index, 5, "WAIT")
+                        logger.info(f"Set Buy Signal to WAIT after sell")
+                        
+                        # Add note that position is closed
+                        try:
+                            current_notes = self.worksheet.cell(row_index, 17).value or ""
+                            profit_percent = "N/A"
+                            
+                            # Calculate profit percentage if we have both buy and sell prices
+                            purchase_price_cell = self.worksheet.cell(row_index, 10).value
+                            if purchase_price_cell and sell_price:
+                                try:
+                                    purchase_price_val = float(str(purchase_price_cell).replace(',', '.'))
+                                    sell_price_val = float(str(sell_price).replace(',', '.'))
+                                    if purchase_price_val > 0:
+                                        profit_percent = f"{((sell_price_val - purchase_price_val) / purchase_price_val) * 100:.2f}%"
+                                except:
+                                    profit_percent = "N/A"
+                                    
+                            new_notes = f"{current_notes} | Position closed: {sold_date} | Profit: {profit_percent}"
+                            self.worksheet.update_cell(row_index, 17, new_notes)
+                            logger.info(f"Updated Notes with position closed information and profit data")
+                        except Exception as e:
+                            logger.error(f"Error updating notes: {str(e)}")
+                        
+                        # Clear the order_id after selling
+                        headers = self.worksheet.row_values(1)
+                        if 'order_id' in headers:
+                            order_id_col = headers.index('order_id') + 1
+                            self.worksheet.update_cell(row_index, order_id_col, "")
+                            logger.info(f"Cleared order_id in column {order_id_col}")
+                    else:
+                        # Bu bir alım işlemi
+                        logger.info(f"This is a BUY operation for row {row_index}")
+                        
+                        self.worksheet.update_cell(row_index, 33, "NO")
+                        logger.info(f"Set Tradable to NO for row {row_index}")
+                        
+                        # Update timestamp (column I - Order Date)
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.worksheet.update_cell(row_index, 9, timestamp)
+                        logger.info(f"Set Order Date to {timestamp}")
+                        
+                        if purchase_price:
+                            # Update Purchase Price (column J) - using EU format
+                            formatted_price = self.format_price_eu(purchase_price)
+                            self.worksheet.update_cell(row_index, 10, formatted_price)
+                            logger.info(f"Set Purchase Price to {formatted_price}")
+                        
+                        if quantity:
+                            # Update Quantity (column K) - using EU format
+                            formatted_quantity = self.format_price_eu(quantity)
+                            self.worksheet.update_cell(row_index, 11, formatted_quantity)
+                            logger.info(f"Set Quantity to {formatted_quantity}")
+                            
+                        # Update Purchase Date (column L)
+                        purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.worksheet.update_cell(row_index, 12, purchase_date)
+                        logger.info(f"Set Purchase Date to {purchase_date}")
+                            
+                        if order_id:
+                            # Store the order ID in both Notes (column Q) and order_id column
+                            notes = f"Order ID: {order_id}"
+                            self.worksheet.update_cell(row_index, 17, notes)
+                            logger.info(f"Updated Notes with Order ID")
+                            
+                            # Also store in the order_id column if it exists
+                            headers = self.worksheet.row_values(1)
+                            if 'order_id' in headers:
+                                order_id_col = headers.index('order_id') + 1
+                                self.worksheet.update_cell(row_index, order_id_col, order_id)
+                                logger.info(f"Updated order_id in column {order_id_col} for row {row_index}: {order_id}")
+                        
+                        # Set Buy Signal to WAIT (column E) to prevent reprocessing
+                        self.worksheet.update_cell(row_index, 5, "WAIT")
+                        logger.info(f"Set Buy Signal to WAIT for row {row_index}")
+                except Exception as e:
+                    # Satış/Alım kontrolü sırasında hata oluştu, varsayılan alım işlemi olarak devam et
+                    logger.error(f"Error determining buy/sell operation: {str(e)}. Proceeding with default buy flow.")
+                    
+                    # Varsayılan olarak alım işlemi gibi davran
+                    self.worksheet.update_cell(row_index, 33, "NO")
+                    logger.info(f"Set Tradable to NO for row {row_index}")
+                    
+                    # Update timestamp (column I - Order Date)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.worksheet.update_cell(row_index, 9, timestamp)
+                    logger.info(f"Set Order Date to {timestamp}")
+                    
+                    if purchase_price:
+                        # Update Purchase Price (column J) - using EU format
+                        formatted_price = self.format_price_eu(purchase_price)
+                        self.worksheet.update_cell(row_index, 10, formatted_price)
+                        logger.info(f"Set Purchase Price to {formatted_price}")
+                    
+                    if quantity:
+                        # Update Quantity (column K) - using EU format
+                        formatted_quantity = self.format_price_eu(quantity)
+                        self.worksheet.update_cell(row_index, 11, formatted_quantity)
+                        logger.info(f"Set Quantity to {formatted_quantity}")
+                        
+                    # Update Purchase Date (column L)
+                    purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.worksheet.update_cell(row_index, 12, purchase_date)
+                    logger.info(f"Set Purchase Date to {purchase_date}")
+                    
+                    if order_id:
+                        # Store the order ID
+                        notes = f"Order ID: {order_id}"
+                        self.worksheet.update_cell(row_index, 17, notes)
+                        logger.info(f"Updated Notes with Order ID")
+                        
+                        headers = self.worksheet.row_values(1)
+                        if 'order_id' in headers:
+                            order_id_col = headers.index('order_id') + 1
+                            self.worksheet.update_cell(row_index, order_id_col, order_id)
+                            logger.info(f"Updated order_id in column {order_id_col}")
+                    
+                    # Set Buy Signal to WAIT
+                    self.worksheet.update_cell(row_index, 5, "WAIT")
+                    logger.info(f"Set Buy Signal to WAIT")
+            
+            # When order fails or is cancelled
+            elif "FAIL" in status or "CANCEL" in status:
+                # Set Tradable back to YES (column AG)
+                self.worksheet.update_cell(row_index, 33, "YES")
+                logger.info(f"Set Tradable back to YES due to {status}")
+                
+                # Set Buy Signal to WAIT to prevent reprocessing
+                self.worksheet.update_cell(row_index, 5, "WAIT")
+                logger.info(f"Set Buy Signal to WAIT due to {status}")
+                
+                # Update Notes with failure reason
+                try:
+                    current_notes = self.worksheet.cell(row_index, 17).value or ""
+                    new_notes = f"{current_notes} | {status} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    self.worksheet.update_cell(row_index, 17, new_notes)
+                    logger.info(f"Updated Notes with failure information")
+                except Exception as e:
+                    logger.error(f"Error updating notes: {str(e)}")
+            
+            logger.info(f"Successfully updated all fields for row {row_index}: {status}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating trade status: {str(e)}")
+            return False
+    
+    def execute_trade(self, trade_signal):
+        """Execute a trade based on the signal"""
+        symbol = trade_signal['symbol']
+        row_index = trade_signal['row_index']
+        action = trade_signal['action']
+        original_symbol = trade_signal['original_symbol']
+        
+        # BUY signal processing
+        if action == "BUY":
+            take_profit = float(trade_signal['take_profit'])
+            stop_loss = float(trade_signal['stop_loss'])
+            
+            # Always use Buy Target price if available, otherwise use Last Price
+            price = float(trade_signal.get('buy_target', trade_signal['last_price']))
+            
+            # Check if we have an active position for this symbol
+            if symbol in self.active_positions:
+                logger.warning(f"Already have an active position for {symbol}, skipping buy")
+                return False
+            
+            # Check if we have sufficient balance
+            if not self.exchange_api.has_sufficient_balance():
+                logger.error(f"Insufficient balance for trade {symbol}")
+                self.update_trade_status(row_index, "ORDER_FAILED")
+                return False
+            
+            try:
+                # Use fixed trade amount - notional value in USDT
+                trade_amount = self.exchange_api.trade_amount
+                
+                logger.info(f"Placing order: BUY {symbol} with {trade_amount} USDT at market price")
+                
+                # Use the buy_coin method which now returns filled price and quantity
+                buy_result = self.exchange_api.buy_coin(symbol, trade_amount)
+                
+                if not buy_result:
+                    logger.error(f"Failed to create buy order for {symbol}")
+                    self.update_trade_status(row_index, "ORDER_FAILED")
+                    return False
+                
+                # Extract order_id, filled_price and filled_quantity from the result
+                order_id = buy_result.get("order_id") if isinstance(buy_result, dict) else buy_result
+                
+                # Wait a bit for the order to settle
+                time.sleep(3)
+                
+                # If we have order ID but no filled price/quantity, try to get order details
+                if isinstance(buy_result, dict) and order_id and not buy_result.get("filled_price"):
+                    logger.info(f"Getting order details for {order_id} to obtain filled price and quantity")
+                    order_details = self.exchange_api.get_order_detail(order_id)
+                    if order_details:
+                        filled_price = order_details.get("filled_price")
+                        filled_quantity = order_details.get("filled_quantity")
+                    else:
+                        # If we can't get filled price/quantity, get current price and balance
+                        filled_price = price  # Use estimated price
+                        # Get actual balance after purchase
+                        base_currency = original_symbol
+                        filled_quantity = self.exchange_api.get_coin_balance(base_currency)
+                        try:
+                            filled_quantity = float(filled_quantity)
+                        except:
+                            filled_quantity = trade_amount / price  # Fallback to estimated quantity
+                else:
+                    # Extract values from the buy_result
+                    filled_price = buy_result.get("filled_price") if isinstance(buy_result, dict) else price
+                    filled_quantity = buy_result.get("filled_quantity") if isinstance(buy_result, dict) else None
+                    
+                    # If still no filled_quantity, get the actual balance
+                    if not filled_quantity:
+                        base_currency = original_symbol
+                        filled_quantity = self.exchange_api.get_coin_balance(base_currency)
+                        try:
+                            filled_quantity = float(filled_quantity)
+                        except:
+                            filled_quantity = trade_amount / price  # Fallback to estimated quantity
+                
+                # Use the actual filled price and quantity for updating the sheet
+                logger.info(f"Order successful. Filled price: {filled_price}, Filled quantity: {filled_quantity}")
+                
+                # Update trade status in sheet including order_id, filled_price and filled_quantity
+                self.update_trade_status(
+                    row_index, 
+                    "ORDER_PLACED", 
+                    order_id, 
+                    purchase_price=filled_price, 
+                    quantity=filled_quantity
+                )
+                
+                # Add to active positions
+                self.active_positions[symbol] = {
+                    'order_id': order_id,
+                    'row_index': row_index,
+                    'quantity': filled_quantity,
+                    'price': filled_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'status': 'ORDER_PLACED'
+                }
+                
+                # Start monitoring thread for this order
+                monitor_thread = threading.Thread(
+                    target=self.monitor_position,
+                    args=(symbol, order_id),
+                    daemon=True
+                )
+                monitor_thread.start()
+                
+                return True
+                    
+            except Exception as e:
+                logger.error(f"Error executing buy trade for {symbol}: {str(e)}")
+                self.update_trade_status(row_index, "ORDER_FAILED")
+                return False
+        
+        # SELL signal processing
+        elif action == "SELL":
+            price = float(trade_signal['last_price'])
+            order_id = trade_signal.get('order_id', '')
+            base_currency = original_symbol  # Güncelleyeceğim satış para birimi
+            
+            try:
+                # Direkt olarak mevcut pozisyonu kullanma
+                quantity = None
+                position_found = False
+                
+                # 1. Önce aktif pozisyonlar içinde sembol üzerinden arama
+                if symbol in self.active_positions:
+                    position = self.active_positions[symbol]
+                    quantity = position['quantity'] 
+                    
+                    # Eğer quantity None veya 0 ise (BONK_USDT sorunu)
+                    if not quantity or float(quantity) <= 0:
+                        logger.warning(f"Position exists for {symbol} but quantity is zero or invalid: {quantity}")
+                        # Pozisyonu düzelt - direkt bakiyeyi kontrol et
+                        try:
+                            fixed_balance = self.exchange_api.get_coin_balance(base_currency)
+                            if fixed_balance and float(fixed_balance) > 0:
+                                quantity = float(fixed_balance)
+                                logger.info(f"Fixed quantity for {symbol} from balance check: {quantity}")
+                                # Pozisyonu güncelle
+                                self.active_positions[symbol]['quantity'] = quantity
+                            else:
+                                logger.warning(f"Could not fix quantity - no balance found for {base_currency}")
+                        except Exception as e:
+                            logger.error(f"Error fixing quantity for {symbol}: {str(e)}")
+                    
+                    logger.info(f"Found active position for {symbol} in tracking system, selling {quantity} at {price}")
+                    position_found = True
+                
+                # 2. Aktif pozisyonda yoksa ve order_id varsa, order_id üzerinden kontrol
+                elif order_id:
+                    logger.info(f"Searching for position with order_id: {order_id}")
+                    
+                    # Order ID üzerinden bakiyeyi al
+                    try:
+                        # Get balance for the base currency (e.g., for SUI_USDT, get SUI balance)
+                        balance = self.exchange_api.get_coin_balance(base_currency)
+                        if balance and float(balance) > 0:
+                            quantity = float(balance)
+                            logger.info(f"Found balance of {quantity} {base_currency} via order ID lookup")
+                            position_found = True
+                            
+                            # Pozisyonu aktif pozisyonlar listesine ekle
+                            self.active_positions[symbol] = {
+                                'order_id': order_id,
+                                'row_index': row_index,
+                                'quantity': quantity,
+                                'price': price,
+                                'status': 'POSITION_ACTIVE'
+                            }
+                        else:
+                            logger.warning(f"No balance found for {base_currency} with order_id {order_id}")
+                    except Exception as e:
+                        logger.error(f"Error getting balance for {base_currency} with order_id {order_id}: {str(e)}")
+                
+                # 3. Son çare: Direkt para biriminden bakiye kontrolü
+                if not position_found:
+                    logger.info(f"No position tracking found, checking balance for {base_currency}")
+                    
+                    try:
+                        # Önce get_coin_balance metodunu deneyelim (daha doğru)
+                        balance = self.exchange_api.get_coin_balance(base_currency)
+                        try:
+                            balance_float = float(balance) if balance else 0
+                        except (ValueError, TypeError):
+                            balance_float = 0
+                            
+                        # Eğer bu metod sıfır dönerse, genel get_balance metodunu deneyelim
+                        if balance_float <= 0:
+                            balance = self.exchange_api.get_balance(base_currency)
+                            try:
+                                balance_float = float(balance) if balance else 0
+                            except (ValueError, TypeError):
+                                balance_float = 0
+                                
+                        # Log detaylı bakiye bilgisi
+                        logger.info(f"Balance check for {base_currency}: direct balance = {balance_float}")
+                        
+                        if balance_float > 0:
+                            quantity = balance_float
+                            logger.info(f"Found balance of {quantity} {base_currency} directly from account")
+                            position_found = True
+                            
+                            # Pozisyonu aktif pozisyonlar listesine ekle
+                            self.active_positions[symbol] = {
+                                'order_id': 'manual',
+                                'row_index': row_index,
+                                'quantity': quantity,
+                                'price': price,
+                                'status': 'POSITION_ACTIVE'
+                            }
+                        else:
+                            logger.warning(f"No balance found for {base_currency} in account")
+                    except Exception as e:
+                        logger.error(f"Error checking balance for {base_currency}: {str(e)}")
+                
+                # Pozisyon bulunamadıysa veya miktar sıfırsa satış yapma
+                if not position_found or not quantity or float(quantity) <= 0:
+                    logger.error(f"Cannot sell {symbol}: No position found or zero quantity")
+                    self.update_trade_status(row_index, "SELL_FAILED")
+                    return False
+                
+                # Miktarı float olarak kullan
+                quantity = float(quantity)
+                
+                # Minimum satış kontrolü (çoğu borsa çok küçük miktarları kabul etmez)
+                # Bu kontrol SUI ve büyük coinler için düşük, memecoinler için daha yüksek olmalı
+                min_sell_amount = 0.0001  # Default minimum
+                if base_currency.upper() in ['BONK', 'SHIB', 'PEPE', 'FLOKI']:
+                    min_sell_amount = 1  # Memecoinler için daha yüksek minimum
+                
+                if quantity < min_sell_amount:
+                    logger.error(f"Cannot sell {symbol}: Quantity too small ({quantity})")
+                    self.update_trade_status(row_index, "SELL_FAILED")
+                    return False
+                
+                # YENİ: Satış miktarını %95 olarak ayarla
+                original_quantity = quantity
+                sell_quantity = quantity * 0.95
+                logger.info(f"Using 95% of position for sell: {original_quantity} -> {sell_quantity}")
+                
+                # Execute the sell with sell_coin method
+                logger.info(f"Placing sell order: SELL {sell_quantity} {symbol} at {price} based on SELL signal")
+                
+                # Create sell order - satış işlemi (adjusted to 95%)
+                sell_order_id = self.exchange_api.sell_coin(symbol, sell_quantity)
+                
+                if not sell_order_id:
+                    logger.error(f"Failed to create sell order for {symbol}")
+                    self.update_trade_status(row_index, "SELL_FAILED")
+                    return False
+                    
+                # Monitor the sell order
+                order_filled = self.exchange_api.monitor_order(sell_order_id)
+                
+                if order_filled:
+                    # Get order details to get actual filled price
+                    order_details = self.exchange_api.get_order_detail(sell_order_id)
+                    if order_details and order_details.get("filled_price"):
+                        filled_price = order_details.get("filled_price")
+                        logger.info(f"Order filled at price: {filled_price}")
+                    else:
+                        filled_price = price  # Use estimated price if details not available
+                    
+                    # KRİTİK: Bu bir satış işlemi, parametre olarak sell_price'ı geçip, purchase_price'ı geçmeyeceğiz
+                    # Update sheet with sell information
+                    self.update_trade_status(
+                        row_index,
+                        "ORDER_PLACED",
+                        sell_price=filled_price,  # Satış fiyatı - gerçek fiyat kullan
+                        quantity=sell_quantity,   # Satış miktarı - %95 kullan
+                        purchase_price=None       # Alım fiyatı OLMAMALI
+                    )
+                    
+                    # Remove from active positions
+                    if symbol in self.active_positions:
+                        del self.active_positions[symbol]
+                    logger.info(f"Successfully sold {sell_quantity} {symbol} at {filled_price}")
+                    return True
+                else:
+                    logger.warning(f"Sell order {sell_order_id} for {symbol} was not filled")
+                    self.update_trade_status(row_index, "SELL_FAILED")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Error executing sell for {symbol}: {str(e)}")
+                self.update_trade_status(row_index, "SELL_FAILED")
+                return False
+
+    def monitor_position(self, symbol, order_id):
+        """Monitor a position for order fill and status updates"""
+        try:
+            # Monitor the order until it's filled or cancelled
+            order_filled = self.exchange_api.monitor_order(order_id)
+            
+            if not order_filled:
+                logger.warning(f"Order {order_id} for {symbol} was not filled")
+                if symbol in self.active_positions:
+                    row_index = self.active_positions[symbol]['row_index']
+                    self.update_trade_status(row_index, "ORDER_CANCELLED")
+                    # Reset Tradable to YES since order was cancelled (column AG - after column AF)
+                    self.worksheet.update_cell(row_index, 33, "YES")
+                    del self.active_positions[symbol]
+                return
+            
+            # Order is filled, update position status
+            if symbol in self.active_positions:
+                row_index = self.active_positions[symbol]['row_index']
+                purchase_price = self.active_positions[symbol]['price']
+                quantity = self.active_positions[symbol]['quantity']
+                
+                self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                self.update_trade_status(
+                    row_index, 
+                    "POSITION_ACTIVE",
+                    purchase_price=purchase_price,
+                    quantity=quantity
+                )
+                
+                # Continue monitoring the active position
+                while symbol in self.active_positions and self.active_positions[symbol]['status'] == 'POSITION_ACTIVE':
+                    # Check for sell conditions (this is where you'd implement your exit strategy)
+                    # For now, this is a placeholder for your actual exit logic
+                    
+                    # Placeholder for sell logic - you can replace this with your actual conditions
+                    # such as checking if price has reached take profit or stop loss levels
+                    
+                    # If sell conditions met, execute sell
+                    # self.execute_sell(symbol)
+                    
+                    # For now, we'll just sleep
+                    time.sleep(self.check_interval)
+            
+        except Exception as e:
+            logger.error(f"Error monitoring position for {symbol}: {str(e)}")
+            if symbol in self.active_positions:
+                row_index = self.active_positions[symbol]['row_index']
+                self.update_trade_status(row_index, "MONITOR_ERROR")
+    
+    def execute_sell(self, symbol, price=None):
+        """Execute a sell order for an active position"""
+        if symbol not in self.active_positions:
+            logger.warning(f"No active position found for {symbol}")
+            return False
+            
+        position = self.active_positions[symbol]
+        row_index = position['row_index']
+        quantity = position['quantity']
+        
+        try:
+            # If price is not provided, get current market price
+            if not price:
+                # Get current price
+                price = self.exchange_api.get_current_price(symbol)
+                if not price:
+                    logger.error(f"Failed to get current price for {symbol}")
+                    price = position['price'] * 1.05  # Fallback: 5% profit
+            
+            # YENİ: Satış miktarını %95 olarak ayarla    
+            original_quantity = quantity
+            sell_quantity = quantity * 0.95
+            logger.info(f"Using 95% of position for sell: {original_quantity} -> {sell_quantity}")
+            
+            logger.info(f"Placing sell order: SELL {sell_quantity} {symbol} at {price}")
+            
+            # Create sell order with sell_coin method (using 95% of quantity)
+            order_id = self.exchange_api.sell_coin(symbol, sell_quantity)
+            
+            if not order_id:
+                logger.error(f"Failed to create sell order for {symbol}")
+                return False
+                
+            # Monitor the sell order
+            order_filled = self.exchange_api.monitor_order(order_id)
+            
+            if order_filled:
+                # Get order details to get actual filled price
+                order_details = self.exchange_api.get_order_detail(order_id)
+                if order_details and order_details.get("filled_price"):
+                    filled_price = order_details.get("filled_price")
+                    logger.info(f"Order filled at price: {filled_price}")
+                else:
+                    filled_price = price  # Use estimated price if details not available
+                
+                # DÜZELTME: Bu bir satış işlemi, sadece sell_price parametresi verilmeli
+                # Update sheet with sell information
+                self.update_trade_status(
+                    row_index,
+                    "ORDER_PLACED",
+                    sell_price=filled_price,  # Gerçek fiyat kullan
+                    quantity=sell_quantity,   # %95 miktarı kullan
+                    purchase_price=None       # Alım fiyatı olmamalı
+                )
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
+                logger.info(f"Successfully sold {sell_quantity} {symbol} at {filled_price}")
+                return True
+            else:
+                logger.warning(f"Sell order {order_id} for {symbol} was not filled")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error executing sell for {symbol}: {str(e)}")
+            return False
+    
+    def run(self):
+        """Main method to run the trade manager"""
+        logger.info("Starting Trade Manager")
+        logger.info(f"Will check for signals every {self.check_interval} seconds")
+        
+        try:
+            while True:
+                # Get and process trade signals
+                signals = self.get_trade_signals()
+                
+                # Process all signals (both BUY and SELL)
+                for signal in signals:
+                    symbol = signal['symbol']
+                    action = signal['action']
+                    
+                    # For BUY signals
+                    if action == "BUY":
+                        # Skip if already have an active position
+                        if symbol in self.active_positions:
+                            logger.debug(f"Skipping BUY for {symbol} - already have an active position")
+                            continue
+                        
+                        # Execute the buy trade
+                        self.execute_trade(signal)
+                    
+                    # For SELL signals
+                    elif action == "SELL":
+                        # Execute the sell trade
+                        # No need to skip if no active position, as execute_trade will handle that
+                        self.execute_trade(signal)
+                    
+                    # Small delay between trades
+                    time.sleep(0.5)
+                
+                # Check for take profit/stop loss in active positions
+                for symbol in list(self.active_positions.keys()):
+                    position = self.active_positions[symbol]
+                    
+                    # Only check positions that are active (not pending orders)
+                    if position['status'] == 'POSITION_ACTIVE':
+                        # Check if take profit or stop loss conditions are met
+                        # This would typically involve getting the current price
+                        try:
+                            current_price = self.exchange_api.get_current_price(symbol)
+                            
+                            if current_price:
+                                # Check for stop loss
+                                if 'stop_loss' in position and current_price <= position['stop_loss']:
+                                    logger.info(f"Stop loss triggered for {symbol} at {current_price} (stop_loss: {position['stop_loss']})")
+                                    self.execute_sell(symbol, current_price)
+                                
+                                # Check for take profit
+                                elif 'take_profit' in position and current_price >= position['take_profit']:
+                                    logger.info(f"Take profit triggered for {symbol} at {current_price} (take_profit: {position['take_profit']})")
+                                    self.execute_sell(symbol, current_price)
+                        except Exception as e:
+                            logger.error(f"Error checking take profit/stop loss for {symbol}: {str(e)}")
+                
+                # Sleep until next check
+                logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
+                time.sleep(self.check_interval)
+                
+        except KeyboardInterrupt:
+            logger.info("Trade Manager stopped by user")
+        except Exception as e:
+            logger.critical(f"Trade Manager crashed: {str(e)}")
+            raise
+
+
+if __name__ == "__main__":
+    try:
+        # Set log level from environment
+        log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        logger.setLevel(getattr(logging, log_level))
+        
+        # Create and run trade manager
+        trade_manager = GoogleSheetTradeManager()
+        trade_manager.run()
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}") 
