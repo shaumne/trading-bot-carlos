@@ -713,8 +713,6 @@ class GoogleSheetTradeManager:
         self.check_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "5"))  # Default 5 seconds
         self.batch_size = int(os.getenv("BATCH_SIZE", "5"))  # Process in batches
         self.active_positions = {}  # Track active positions
-        self.atr_period = int(os.getenv("ATR_PERIOD", "14"))  # Default ATR period
-        self.atr_multiplier = float(os.getenv("ATR_MULTIPLIER", "2.0"))  # Default ATR multiplier
         
         # Connect to Google Sheets
         scope = [
@@ -737,9 +735,6 @@ class GoogleSheetTradeManager:
         
         # Ensure order_id column exists
         self.ensure_order_id_column_exists()
-        
-        # ATR verilerini saklamak için cache oluştur
-        self.atr_cache = {}  # {symbol: {'atr': value, 'timestamp': last_update_time}}
     
     def ensure_order_id_column_exists(self):
         """Ensure that the order_id column exists in the worksheet"""
@@ -759,153 +754,6 @@ class GoogleSheetTradeManager:
                 logger.info("'order_id' column already exists in worksheet")
         except Exception as e:
             logger.error(f"Error ensuring order_id column exists: {str(e)}")
-    
-    def calculate_atr(self, symbol, period=14):
-        """
-        Calculate Average True Range (ATR) for a symbol
-        
-        ATR measures the volatility of a cryptocurrency over a specific period
-        """
-        try:
-            # Check if we have cached ATR
-            current_time = time.time()
-            if symbol in self.atr_cache:
-                # If cache is less than 1 hour old, use cached value
-                if current_time - self.atr_cache[symbol]['timestamp'] < 3600:
-                    logger.info(f"Using cached ATR for {symbol}: {self.atr_cache[symbol]['atr']}")
-                    return self.atr_cache[symbol]['atr']
-            
-            # Get historical price data
-            # Bu kısımda gerçek API'dan veri alımı yapabilirsiniz, şu anda basitleştirilmiş bir hesaplama yapacağız
-            logger.info(f"Calculating ATR for {symbol} with period {period}")
-            
-            # Gerçek bir hesaplama için, exchange API'dan son {period} günlük yüksek, düşük ve kapanış verilerini alın
-            # Şimdilik mevcut fiyatın %3'ünü ATR olarak kabul edelim (basitleştirilmiş)
-            current_price = self.exchange_api.get_current_price(symbol)
-            
-            if not current_price:
-                logger.warning(f"Cannot get current price for {symbol}, using default ATR")
-                # Symbol cinsinden varsayılan ATR değerleri
-                default_atr_values = {
-                    "BTC_USDT": 800.0,
-                    "ETH_USDT": 50.0,
-                    "SUI_USDT": 0.1,
-                    "BONK_USDT": 0.000001,
-                    "DOGE_USDT": 0.01,
-                    "XRP_USDT": 0.05
-                }
-                
-                # Varsayılan değer yoksa fiyatın %3'ünü kullan
-                default_atr = default_atr_values.get(symbol, 0.03 * (current_price or 1.0))
-                
-                # Cache'e ekle
-                self.atr_cache[symbol] = {
-                    'atr': default_atr,
-                    'timestamp': current_time
-                }
-                
-                return default_atr
-            
-            # Gerçek ATR hesaplaması için:
-            # 1. Son 'period' günlük verileri al
-            # 2. Her gün için True Range hesapla: max(high - low, abs(high - prev_close), abs(low - prev_close))
-            # 3. Son 'period' günlük True Range'lerin ortalamasını al
-            
-            # Basitleştirilmiş hesaplama (gerçek hesaplama değil)
-            # Fiyatın %3'ünü ATR olarak kabul ediyoruz
-            simplified_atr = current_price * 0.03
-            
-            # Cache'e ekle
-            self.atr_cache[symbol] = {
-                'atr': simplified_atr,
-                'timestamp': current_time
-            }
-            
-            logger.info(f"Calculated ATR for {symbol}: {simplified_atr}")
-            return simplified_atr
-            
-        except Exception as e:
-            logger.error(f"Error calculating ATR for {symbol}: {str(e)}")
-            return None
-    
-    def calculate_stop_loss(self, symbol, entry_price, swing_low=None):
-        """
-        ATR ve Swing Low tabanlı Stop Loss hesapla
-        
-        Parameters:
-            symbol (str): İşlem çifti (örn. BTC_USDT)
-            entry_price (float): Giriş fiyatı
-            swing_low (float, optional): Varsa, son swing low değeri
-            
-        Returns:
-            float: Hesaplanan stop loss değeri
-        """
-        try:
-            # ATR hesapla
-            atr = self.calculate_atr(symbol, self.atr_period)
-            
-            if not atr:
-                logger.warning(f"Cannot calculate ATR for {symbol}, using default stop loss")
-                # Default olarak giriş fiyatının %5 altı
-                return entry_price * 0.95
-            
-            # ATR-tabanlı stop loss
-            atr_stop_loss = entry_price - (atr * self.atr_multiplier)
-            
-            # Eğer swing low verilmişse, ikisinden daha düşük olanı kullan
-            if swing_low and swing_low < entry_price:
-                final_stop_loss = min(atr_stop_loss, swing_low)
-                
-                # Swing low'a %1'lik buffer ekle
-                final_stop_loss = final_stop_loss * 0.99
-            else:
-                final_stop_loss = atr_stop_loss
-            
-            logger.info(f"Calculated stop loss for {symbol}: {final_stop_loss} (Entry: {entry_price}, ATR: {atr})")
-            return final_stop_loss
-            
-        except Exception as e:
-            logger.error(f"Error calculating stop loss for {symbol}: {str(e)}")
-            # Default olarak giriş fiyatının %5 altı
-            return entry_price * 0.95
-    
-    def calculate_take_profit(self, symbol, entry_price, resistance_level=None):
-        """
-        ATR ve Direnç Seviyesi tabanlı Take Profit hesapla
-        
-        Parameters:
-            symbol (str): İşlem çifti (örn. BTC_USDT)
-            entry_price (float): Giriş fiyatı
-            resistance_level (float, optional): Varsa, direnç seviyesi
-            
-        Returns:
-            float: Hesaplanan take profit değeri
-        """
-        try:
-            # ATR hesapla
-            atr = self.calculate_atr(symbol, self.atr_period)
-            
-            if not atr:
-                logger.warning(f"Cannot calculate ATR for {symbol}, using default take profit")
-                # Default olarak giriş fiyatının %10 üstü
-                return entry_price * 1.10
-            
-            # Minimum take profit mesafesi (ATR tabanlı)
-            minimum_tp_distance = entry_price + (atr * self.atr_multiplier)
-            
-            # Eğer direnç seviyesi verilmişse ve minimum mesafeden büyükse onu kullan
-            if resistance_level and resistance_level > minimum_tp_distance:
-                final_take_profit = resistance_level
-            else:
-                final_take_profit = minimum_tp_distance
-            
-            logger.info(f"Calculated take profit for {symbol}: {final_take_profit} (Entry: {entry_price}, ATR: {atr})")
-            return final_take_profit
-            
-        except Exception as e:
-            logger.error(f"Error calculating take profit for {symbol}: {str(e)}")
-            # Default olarak giriş fiyatının %10 üstü
-            return entry_price * 1.10
     
     def get_trade_signals(self):
         """Get coins marked for trading from Google Sheet"""
@@ -977,27 +825,30 @@ class GoogleSheetTradeManager:
                         resistance_up = float(resistance_up_str)
                         resistance_down = float(resistance_down_str)
                         
+                        # Always calculate Take Profit as 5% below Resistance Up
+                        # If resistance up is zero or invalid, use 20% above last price
+                        if resistance_up > 0:
+                            take_profit = resistance_up * 0.95
+                            logger.info(f"Calculated Take Profit for {symbol} based on Resistance Up: {take_profit}")
+                        else:
+                            take_profit = last_price * 1.20
+                            logger.info(f"Invalid Resistance Up for {symbol}, using default Take Profit: {take_profit}")
+                            
+                        # Always calculate Stop Loss as 5% below Resistance Down (Support)
+                        # If resistance down is zero or invalid, use 10% below last price
+                        if resistance_down > 0:
+                            stop_loss = resistance_down * 0.95
+                            logger.info(f"Calculated Stop Loss for {symbol} based on Resistance Down: {stop_loss}")
+                        else:
+                            stop_loss = last_price * 0.90
+                            logger.info(f"Invalid Resistance Down for {symbol}, using default Stop Loss: {stop_loss}")
+                        
                         # Get buy target if available (or use last price)
                         buy_target_str = str(row.get('Buy Target', '0')).replace(',', '.')
                         if not buy_target_str or buy_target_str.strip() == '':
                             buy_target = last_price
                         else:
                             buy_target = float(buy_target_str)
-                        
-                        # ATR tabanlı Stop Loss ve Take Profit hesapla
-                        entry_price = buy_target  # Alış fiyatı
-                        
-                        # Swing Low için Resistance Down'u kullan (Support seviyesi olarak)
-                        swing_low = resistance_down if resistance_down > 0 else None
-                        
-                        # Resistance Up'ı direnç seviyesi olarak kullan
-                        resistance_level = resistance_up if resistance_up > 0 else None
-                        
-                        # Stop Loss ve Take Profit hesapla
-                        stop_loss = self.calculate_stop_loss(formatted_pair, entry_price, swing_low)
-                        take_profit = self.calculate_take_profit(formatted_pair, entry_price, resistance_level)
-                        
-                        logger.info(f"ATR-based values for {symbol}: stop_loss={stop_loss}, take_profit={take_profit}")
                         
                         # Log parsed values for debugging
                         logger.debug(f"Parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
@@ -1057,9 +908,9 @@ class GoogleSheetTradeManager:
                 
         except Exception as e:
             logger.error(f"Error getting trade signals: {str(e)}")
-            return []
+            return [] 
 
-    def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None, stop_loss=None, take_profit=None):
+    def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None):
         """Update trade status in Google Sheet"""
         try:
             # Kolon indeksleri (1-indexed):
@@ -1127,17 +978,6 @@ class GoogleSheetTradeManager:
                     formatted_quantity = format_number_for_sheet(quantity)
                     self.worksheet.update_cell(row_index, 11, formatted_quantity)
                     logger.info(f"Updated quantity: {quantity} as {formatted_quantity}")
-                
-                # Update Take Profit and Stop Loss columns
-                if take_profit:
-                    formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, 6, formatted_tp)
-                    logger.info(f"Updated Take Profit: {take_profit} as {formatted_tp}")
-                    
-                if stop_loss:
-                    formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, 7, formatted_sl)
-                    logger.info(f"Updated Stop Loss: {stop_loss} as {formatted_sl}")
                     
                 # Update Purchase Date (column 12)
                 self.worksheet.update_cell(row_index, 12, timestamp)
@@ -1203,18 +1043,6 @@ class GoogleSheetTradeManager:
                     self.worksheet.update_cell(row_index, order_id_col, "")
                     logger.info(f"Cleared order_id in column {order_id_col} for row {row_index}")
             
-            # Just update Take Profit and Stop Loss without changing status
-            elif status == "UPDATE_TP_SL":
-                if take_profit:
-                    formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, 6, formatted_tp)
-                    logger.info(f"Updated Take Profit: {take_profit} as {formatted_tp}")
-                    
-                if stop_loss:
-                    formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, 7, formatted_sl)
-                    logger.info(f"Updated Stop Loss: {stop_loss} as {formatted_sl}")
-            
             logger.info(f"Successfully updated trade status for row {row_index}: {status}")
             return True
         except Exception as e:
@@ -1264,16 +1092,8 @@ class GoogleSheetTradeManager:
                 # Quantity için varsayılan değer (sheet güncellemesi için)
                 estimated_quantity = trade_amount / price if price > 0 else 0
                 
-                # Update trade status in sheet including order_id, stop_loss and take_profit
-                self.update_trade_status(
-                    row_index, 
-                    "ORDER_PLACED", 
-                    order_id, 
-                    purchase_price=price, 
-                    quantity=estimated_quantity,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
-                )
+                # Update trade status in sheet including order_id
+                self.update_trade_status(row_index, "ORDER_PLACED", order_id, purchase_price=price, quantity=estimated_quantity)
                 
                 # Add to active positions
                 self.active_positions[symbol] = {
@@ -1283,7 +1103,6 @@ class GoogleSheetTradeManager:
                     'price': price,
                     'stop_loss': stop_loss,
                     'take_profit': take_profit,
-                    'highest_price': price,  # Trailing stop için en yüksek fiyatı takip etmek üzere
                     'status': 'ORDER_PLACED'
                 }
                 
@@ -1436,50 +1255,403 @@ class GoogleSheetTradeManager:
             except Exception as e:
                 logger.error(f"Error executing sell for {symbol}: {str(e)}")
                 return False
-    
-    def calculate_trailing_stop(self, symbol, current_price, position):
-        """
-        Calculate trailing stop based on ATR and current price
-        
-        Parameters:
-            symbol (str): Trading symbol (e.g. BTC_USDT)
-            current_price (float): Current market price
-            position (dict): The active position data
-            
-        Returns:
-            float: New trailing stop price
-        """
+
+    def monitor_position(self, symbol, order_id):
+        """Monitor a position for order fill and status updates"""
         try:
-            # Get the position data
-            entry_price = position.get('price', 0)
-            current_stop_loss = position.get('stop_loss', 0)
-            highest_price = position.get('highest_price', entry_price)
+            # Wait a moment for order processing
+            time.sleep(5)
             
-            # If current price is higher than our highest tracked price, update it
-            if current_price > highest_price:
-                # Calculate new ATR for the symbol
-                atr = self.calculate_atr(symbol, self.atr_period)
+            # Check order status
+            status = self.exchange_api.get_order_status(order_id)
+            logger.info(f"Initial order status for {order_id}: {status}")
+            
+            # Get order details to check if it was partially executed
+            try:
+                method = "private/get-order-detail"
+                params = {"order_id": order_id}
+                order_detail = self.exchange_api.send_request(method, params)
                 
-                if not atr:
-                    logger.warning(f"Cannot calculate ATR for trailing stop, using default method")
-                    # Default method: 2% below current price if it's higher than previous stop
-                    new_stop_loss = current_price * 0.98
+                partially_filled = False
+                cumulative_quantity = 0
+                avg_price = 0
+                
+                if order_detail.get("code") == 0:
+                    result = order_detail.get("result", {})
+                    
+                    # Check if order was partially filled
+                    if "cumulative_quantity" in result and float(result.get("cumulative_quantity", "0")) > 0:
+                        cumulative_quantity = float(result.get("cumulative_quantity"))
+                        logger.info(f"Order {order_id} was partially filled: {cumulative_quantity} units")
+                        partially_filled = True
+                        
+                    if "avg_price" in result:
+                        avg_price = float(result.get("avg_price", "0"))
+                        logger.info(f"Average execution price: {avg_price}")
+            except Exception as e:
+                logger.error(f"Error checking order details: {str(e)}")
+                partially_filled = False
+            
+            # For CANCELED orders that were partially filled, treat them as FILLED
+            if status == "CANCELED" and partially_filled:
+                logger.warning(f"Order {order_id} for {symbol} was CANCELED but partially filled with {cumulative_quantity} units")
+                if symbol in self.active_positions:
+                    row_index = self.active_positions[symbol]['row_index']
+                    
+                    # Update with actual purchase details
+                    if cumulative_quantity > 0:
+                        self.active_positions[symbol]['quantity'] = cumulative_quantity
+                        self.worksheet.update_cell(row_index, 11, str(cumulative_quantity))
+                        logger.info(f"Updated quantity to {cumulative_quantity}")
+                    
+                    if avg_price > 0:
+                        self.active_positions[symbol]['price'] = avg_price
+                        self.worksheet.update_cell(row_index, 10, str(avg_price))
+                        logger.info(f"Updated purchase price to {avg_price}")
+                    
+                    # Update position status
+                    self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                    self.update_trade_status(row_index, "POSITION_ACTIVE")
+                    logger.info(f"Position marked as active despite order cancellation because it was partially filled")
+                    return True
+                    
+            # For CANCELED orders that were NOT filled
+            elif status in ["CANCELED", "REJECTED", "EXPIRED"] and not partially_filled:
+                logger.warning(f"Order {order_id} for {symbol} was {status} and not filled")
+                if symbol in self.active_positions:
+                    row_index = self.active_positions[symbol]['row_index']
+                    
+                    # Update order status in sheet
+                    self.update_trade_status(row_index, f"ORDER_{status}")
+                    
+                    # Set Buy Signal back to WAIT
+                    self.worksheet.update_cell(row_index, 5, "WAIT")
+                    logger.info(f"Reset Buy Signal to WAIT for row {row_index}")
+                    
+                    # Set Tradable back to YES
+                    try:
+                        tradable_col = 34
+                        self.worksheet.update_cell(row_index, tradable_col, "YES")
+                        logger.info(f"Reset Tradable to YES for row {row_index}")
+                    except Exception as e:
+                        logger.error(f"Error updating Tradable column: {str(e)}")
+                    
+                    # Remove from active positions
+                    del self.active_positions[symbol]
+                return
+            
+            # If order already FILLED
+            if status == "FILLED":
+                logger.info(f"Order {order_id} for {symbol} is already filled")
+                if symbol in self.active_positions:
+                    row_index = self.active_positions[symbol]['row_index']
+                    
+                    # Try to get actual quantity from order details
+                    try:
+                        method = "private/get-order-detail"
+                        params = {"order_id": order_id}
+                        order_detail = self.exchange_api.send_request(method, params)
+                        
+                        if order_detail.get("code") == 0:
+                            result = order_detail.get("result", {})
+                            
+                            # Update actual purchase price and quantity
+                            if "avg_price" in result:
+                                purchase_price = float(result.get("avg_price"))
+                                logger.info(f"Actual purchase price: {purchase_price}")
+                                self.active_positions[symbol]['price'] = purchase_price
+                                self.worksheet.update_cell(row_index, 10, str(purchase_price))
+                            
+                            if "cumulative_quantity" in result:
+                                quantity = float(result.get("cumulative_quantity"))
+                                logger.info(f"Actual quantity: {quantity}")
+                                self.active_positions[symbol]['quantity'] = quantity
+                                self.worksheet.update_cell(row_index, 11, str(quantity))
+                    except Exception as e:
+                        logger.error(f"Error updating actual purchase details: {str(e)}")
+                    
+                    # Update position status
+                    self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                    self.update_trade_status(row_index, "POSITION_ACTIVE")
+                return True
+            
+            # For orders still processing, continue monitoring
+            max_checks = 12
+            check_interval = 5
+            checks = 0
+            
+            while checks < max_checks:
+                status = self.exchange_api.get_order_status(order_id)
+                logger.info(f"Order {order_id} status check {checks+1}/{max_checks}: {status}")
+                
+                # Check for partial fills even if canceled
+                if status == "CANCELED":
+                    try:
+                        method = "private/get-order-detail"
+                        params = {"order_id": order_id}
+                        order_detail = self.exchange_api.send_request(method, params)
+                        
+                        if order_detail.get("code") == 0:
+                            result = order_detail.get("result", {})
+                            
+                            if "cumulative_quantity" in result and float(result.get("cumulative_quantity", "0")) > 0:
+                                cumulative_quantity = float(result.get("cumulative_quantity"))
+                                avg_price = float(result.get("avg_price", "0"))
+                                
+                                logger.warning(f"Order {order_id} was CANCELED but filled {cumulative_quantity} at {avg_price}")
+                                
+                                if symbol in self.active_positions:
+                                    row_index = self.active_positions[symbol]['row_index']
+                                    
+                                    # Update with partial fill data
+                                    self.active_positions[symbol]['quantity'] = cumulative_quantity
+                                    self.active_positions[symbol]['price'] = avg_price
+                                    self.worksheet.update_cell(row_index, 11, str(cumulative_quantity))
+                                    self.worksheet.update_cell(row_index, 10, str(avg_price))
+                                    
+                                    # Update position status
+                                    self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                                    self.update_trade_status(row_index, "POSITION_ACTIVE")
+                                    return True
+                    except Exception as e:
+                        logger.error(f"Error checking partial fills: {str(e)}")
+                
+                if status == "FILLED":
+                    logger.info(f"Order {order_id} for {symbol} is filled")
+                    if symbol in self.active_positions:
+                        row_index = self.active_positions[symbol]['row_index']
+                        
+                        # Try to get actual quantity from order details
+                        try:
+                            method = "private/get-order-detail"
+                            params = {"order_id": order_id}
+                            order_detail = self.exchange_api.send_request(method, params)
+                            
+                            if order_detail.get("code") == 0:
+                                result = order_detail.get("result", {})
+                                
+                                # Update actual purchase price and quantity
+                                if "avg_price" in result:
+                                    purchase_price = float(result.get("avg_price"))
+                                    logger.info(f"Actual purchase price: {purchase_price}")
+                                    self.active_positions[symbol]['price'] = purchase_price
+                                    self.worksheet.update_cell(row_index, 10, str(purchase_price))
+                                
+                                if "cumulative_quantity" in result:
+                                    quantity = float(result.get("cumulative_quantity"))
+                                    logger.info(f"Actual quantity: {quantity}")
+                                    self.active_positions[symbol]['quantity'] = quantity
+                                    self.worksheet.update_cell(row_index, 11, str(quantity))
+                        except Exception as e:
+                            logger.error(f"Error updating actual purchase details: {str(e)}")
+                        
+                        # Update position status
+                        self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                        self.update_trade_status(row_index, "POSITION_ACTIVE")
+                    return True
+                elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                    # Already handled partial fills above if needed
+                    if partially_filled:
+                        return True
+                        
+                    logger.warning(f"Order {order_id} for {symbol} was {status}")
+                    if symbol in self.active_positions:
+                        row_index = self.active_positions[symbol]['row_index']
+                        
+                        # Update order status in sheet
+                        self.update_trade_status(row_index, f"ORDER_{status}")
+                        
+                        # Set Buy Signal back to WAIT
+                        self.worksheet.update_cell(row_index, 5, "WAIT")
+                        logger.info(f"Reset Buy Signal to WAIT for row {row_index}")
+                        
+                        # Set Tradable back to YES
+                        try:
+                            tradable_col = 34
+                            self.worksheet.update_cell(row_index, tradable_col, "YES")
+                            logger.info(f"Reset Tradable to YES for row {row_index}")
+                        except Exception as e:
+                            logger.error(f"Error updating Tradable column: {str(e)}")
+                        
+                        # Remove from active positions
+                        del self.active_positions[symbol]
+                    return False
+                # Aynı status kontrolünü her seferinde yapmak yerine, geçerli işlem durumunu saklayalım
+                elif status != 'ACTIVE' and status != 'PENDING' and status != 'PROCESSING':
+                    logger.warning(f"Order {order_id} status changed to unexpected state: {status}")
+                
+                logger.debug(f"Order {order_id} status: {status}, checking again in {check_interval} seconds")
+                time.sleep(check_interval)
+                checks += 1
+                
+            logger.warning(f"Monitoring timed out for order {order_id}")
+            if symbol in self.active_positions:
+                row_index = self.active_positions[symbol]['row_index']
+                
+                # Son durumu tekrar kontrol edelim, belki timeout esnasında durum değişmiştir
+                final_status = self.exchange_api.get_order_status(order_id)
+                
+                # Check one more time for partial fills
+                try:
+                    method = "private/get-order-detail"
+                    params = {"order_id": order_id}
+                    order_detail = self.exchange_api.send_request(method, params)
+                    
+                    if order_detail.get("code") == 0:
+                        result = order_detail.get("result", {})
+                        
+                        if "cumulative_quantity" in result and float(result.get("cumulative_quantity", "0")) > 0:
+                            cumulative_quantity = float(result.get("cumulative_quantity"))
+                            avg_price = float(result.get("avg_price", "0"))
+                            
+                            logger.warning(f"Found partial fill after timeout: {cumulative_quantity} at {avg_price}")
+                            
+                            # Update with partial fill data
+                            self.active_positions[symbol]['quantity'] = cumulative_quantity
+                            self.active_positions[symbol]['price'] = avg_price
+                            self.worksheet.update_cell(row_index, 11, str(cumulative_quantity))
+                            self.worksheet.update_cell(row_index, 10, str(avg_price))
+                            
+                            # Update position status
+                            self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                            self.update_trade_status(row_index, "POSITION_ACTIVE")
+                            return True
+                except Exception as e:
+                    logger.error(f"Error checking final partial fills: {str(e)}")
+                
+                if final_status == "FILLED":
+                    # Sipariş doldurulmuş, pozisyonu aktifleştirelim
+                    logger.info(f"Order {order_id} is filled after timeout check")
+                    self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                    self.update_trade_status(row_index, "POSITION_ACTIVE")
+                    return True
                 else:
-                    # ATR-based trailing stop: current price - (ATR * multiplier)
-                    new_stop_loss = current_price - (atr * self.atr_multiplier)
-                    logger.info(f"Calculated new trailing stop for {symbol}: {new_stop_loss} (Current price: {current_price}, ATR: {atr})")
-                
-                # Only move the stop loss up, never down (trailing stop principle)
-                if new_stop_loss > current_stop_loss:
-                    logger.info(f"Updating trailing stop for {symbol} from {current_stop_loss} to {new_stop_loss}")
-                    return new_stop_loss, current_price  # Return new stop and highest price
-            
-            # If price hasn't made a new high, keep the current stop loss
-            return current_stop_loss, highest_price
+                    # Mark as timeout in sheet
+                    self.update_trade_status(row_index, "MONITOR_TIMEOUT")
+                    
+                    # Set Tradable back to YES
+                    try:
+                        tradable_col = 34
+                        self.worksheet.update_cell(row_index, tradable_col, "YES")
+                        logger.info(f"Reset Tradable to YES due to timeout for row {row_index}")
+                    except Exception as e:
+                        logger.error(f"Error updating Tradable column: {str(e)}")
+                    
+                    # Remove from active positions
+                    del self.active_positions[symbol]
+            return False
             
         except Exception as e:
-            logger.error(f"Error calculating trailing stop for {symbol}: {str(e)}")
-            return position.get('stop_loss', 0), position.get('highest_price', entry_price)
+            logger.error(f"Error monitoring position for {symbol}: {str(e)}")
+            if symbol in self.active_positions:
+                row_index = self.active_positions[symbol]['row_index']
+                self.update_trade_status(row_index, "MONITOR_ERROR")
+                
+                # Set Tradable back to YES
+                try:
+                    tradable_col = 34
+                    self.worksheet.update_cell(row_index, tradable_col, "YES")
+                    logger.info(f"Reset Tradable to YES due to error for row {row_index}")
+                except Exception as e:
+                    logger.error(f"Error updating Tradable column: {str(e)}")
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
+    
+    def execute_sell(self, symbol, price=None):
+        """Execute a sell order for an active position"""
+        if symbol not in self.active_positions:
+            logger.warning(f"No active position found for {symbol}")
+            return False
+            
+        position = self.active_positions[symbol]
+        row_index = position['row_index']
+        quantity = position['quantity']
+        
+        try:
+            # If price is not provided, get current market price
+            if not price:
+                # Get current price
+                price = self.exchange_api.get_current_price(symbol)
+                if not price:
+                    logger.error(f"Failed to get current price for {symbol}")
+                    price = position['price'] * 1.05  # Fallback: 5% profit
+                
+            logger.info(f"Placing sell order: SELL {quantity} {symbol} at {price}")
+            
+            # Create sell order with sell_coin method
+            order_id = self.exchange_api.sell_coin(symbol, quantity)
+            
+            if not order_id:
+                logger.error(f"Failed to create sell order for {symbol}")
+                return False
+                
+            # Monitor the sell order
+            order_filled = self.exchange_api.monitor_order(order_id)
+            
+            if order_filled:
+                # Update sheet with sell information
+                self.update_trade_status(
+                    row_index,
+                    "SOLD",
+                    sell_price=price,
+                    quantity=quantity
+                )
+                
+                # Remove from active positions
+                del self.active_positions[symbol]
+                return True
+            else:
+                logger.warning(f"Sell order {order_id} for {symbol} was not filled")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error executing sell for {symbol}: {str(e)}")
+            return False
+    
+    def monitor_sell_order(self, symbol, order_id, row_index, check_interval=10, max_checks=6):
+        """Monitor a sell order specifically to confirm it's filled and update sheet accordingly"""
+        try:
+            # Wait briefly before first check
+            time.sleep(check_interval)
+            
+            # Check status a few times
+            for i in range(max_checks):
+                status = self.exchange_api.get_order_status(order_id)
+                logger.info(f"Sell order {order_id} status check {i+1}/{max_checks}: {status}")
+                
+                if status == "FILLED":
+                    logger.info(f"Confirmed sell order {order_id} is filled")
+                    
+                    # Double-check that Google Sheet was updated
+                    try:
+                        # Check if 'Sold?' column is properly set
+                        sold_status = self.worksheet.cell(row_index, 13).value
+                        if sold_status != "YES":
+                            logger.warning(f"Sold status not properly set in sheet, fixing now")
+                            self.update_trade_status(row_index, "SOLD")
+                        
+                        # Ensure Buy Signal is set to WAIT
+                        buy_signal = self.worksheet.cell(row_index, 5).value
+                        if buy_signal != "WAIT":
+                            logger.warning(f"Buy Signal not set to WAIT, fixing now")
+                            self.worksheet.update_cell(row_index, 5, "WAIT")
+                    except Exception as e:
+                        logger.error(f"Error verifying sheet updates after sell: {str(e)}")
+                    
+                    return True
+                elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                    logger.warning(f"Sell order {order_id} failed with status: {status}")
+                    return False
+                
+                time.sleep(check_interval)
+            
+            logger.warning(f"Monitoring timed out for sell order {order_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error monitoring sell order {order_id}: {str(e)}")
+            return False
     
     def run(self):
         """Main method to run the trade manager"""
@@ -1521,40 +1693,18 @@ class GoogleSheetTradeManager:
                     
                     # Only check positions that are active (not pending orders)
                     if position['status'] == 'POSITION_ACTIVE':
-                        row_index = position['row_index']
-                        
                         # Check if take profit or stop loss conditions are met
                         # This would typically involve getting the current price
                         try:
                             current_price = self.exchange_api.get_current_price(symbol)
                             
                             if current_price:
-                                # Update highest price and calculate trailing stop
-                                new_stop_loss, new_highest_price = self.calculate_trailing_stop(
-                                    symbol, current_price, position
-                                )
-                                
-                                # If the stop loss moved, update it in our position tracking and in the sheet
-                                if new_stop_loss != position['stop_loss']:
-                                    position['stop_loss'] = new_stop_loss
-                                    position['highest_price'] = new_highest_price
-                                    
-                                    # Update the sheet with the new stop loss
-                                    self.update_trade_status(
-                                        row_index,
-                                        "UPDATE_TP_SL",
-                                        stop_loss=new_stop_loss,
-                                        take_profit=position.get('take_profit')
-                                    )
-                                    
-                                    logger.info(f"Updated trailing stop for {symbol} to {new_stop_loss} (price: {current_price})")
-                                
-                                # Check for stop loss hit (including trailing stop)
-                                if current_price <= position['stop_loss']:
+                                # Check for stop loss
+                                if 'stop_loss' in position and current_price <= position['stop_loss']:
                                     logger.info(f"Stop loss triggered for {symbol} at {current_price} (stop_loss: {position['stop_loss']})")
                                     self.execute_sell(symbol, current_price)
                                 
-                                # Check for take profit hit
+                                # Check for take profit
                                 elif 'take_profit' in position and current_price >= position['take_profit']:
                                     logger.info(f"Take profit triggered for {symbol} at {current_price} (take_profit: {position['take_profit']})")
                                     self.execute_sell(symbol, current_price)
