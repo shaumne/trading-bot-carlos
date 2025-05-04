@@ -1,3 +1,28 @@
+#!/bin/bash
+
+# Trading Bot AWS Deploy Script - Tek Adımda Kurulum
+# Bu script AWS sunucunuzda direkt olarak çalıştırılacak şekilde hazırlanmıştır
+
+# Renkli konsol çıktıları
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Trading Bot Kurulumu Başlatılıyor...${NC}"
+
+# Ana dizin oluştur
+MAIN_DIR=~/trading_bot
+mkdir -p $MAIN_DIR
+cd $MAIN_DIR
+
+echo -e "${YELLOW}Gerekli paketler yükleniyor...${NC}"
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-venv
+
+# strategy.py dosyasını oluştur
+echo -e "${YELLOW}strategy.py dosyası oluşturuluyor...${NC}"
+cat > $MAIN_DIR/strategy.py << 'EOL'
 import os
 import time
 import hmac
@@ -14,8 +39,6 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from tradingview_ta import TA_Handler, Interval, Exchange
 from oauth2client.service_account import ServiceAccountCredentials
-import traceback
-import sys
 
 # Configure logging
 logging.basicConfig(
@@ -205,13 +228,10 @@ class TradingViewDataProvider:
         data["ma50_valid"] = data["last_price"] > data["ma50"]
         data["ema10_valid"] = data["last_price"] > data["ema10"]
         
-        # Count how many MA conditions are valid
-        valid_ma_count = sum([data["ma200_valid"], data["ma50_valid"], data["ema10_valid"]])
-        
-        # Buy signal: RSI < 45 (more relaxed) and at least 2 MA conditions are valid
+        # Buy signal: RSI < 40 and technical conditions are favorable
         data["buy_signal"] = (
-            data["rsi"] < 45 and
-            valid_ma_count >= 2
+            data["rsi"] < 40 and
+            sum([data["ma200_valid"], data["ma50_valid"], data["ema10_valid"]]) >= 2
         )
         
         # Sell signal: RSI > 70 and price breaks resistance
@@ -294,7 +314,7 @@ class GoogleSheetIntegration:
         # Cache for trading pairs
         self._trading_pairs_cache = []
         self._last_pairs_fetch_time = 0
-        self._pairs_cache_duration = 10 # 3 dakikadan 1 dakikaya düşür
+        self._pairs_cache_duration = 180  # Cache trading pairs for 3 minutes (reduced from 5 minutes)
         self._consecutive_errors = 0
         self._max_retry_interval = 60  # Maximum backoff time in seconds
         self._prev_symbol_set = set()  # Track coins for change detection
@@ -626,8 +646,8 @@ class GoogleSheetIntegration:
         try:
             curr_price = float(current_values.get("last_price", "0").replace(',', '.'))
             new_price = float(new_values["last_price"])
-            # Fiyat değişimi %0.1'den fazlaysa değişmiş sayılır
-            if abs(curr_price - new_price) / max(curr_price, 1e-10) > 0.001:  # 0.005 yerine 0.001
+            # If price change is more than 0.5%, consider it changed
+            if abs(curr_price - new_price) / max(curr_price, 1e-10) > 0.005:
                 changes.append(f"price: {curr_price} -> {new_price}")
         except:
             # If conversion fails, consider it changed
@@ -838,18 +858,6 @@ class GoogleSheetIntegration:
             return len(pairs)
         except:
             return "Unknown"
-
-    def update_timestamp_only(self, row_index, data):
-        """Sadece timestamp sütununu güncelle"""
-        try:
-            timestamp_cell = self.worksheet.cell(row_index, 23)  # W sütunu
-            timestamp_cell.value = data["timestamp"]
-            self.worksheet.update_cells([timestamp_cell])
-            logger.info(f"Timestamp updated for row {row_index}: {data['timestamp']}")
-            return True
-        except Exception as e:
-            logger.error(f"Error updating timestamp: {str(e)}")
-            return False
 
 class TelegramNotifier:
     """Class to handle Telegram notifications using a background thread and message queue"""
@@ -1193,16 +1201,6 @@ class TradingBot:
             # Store current action for next comparison
             self._previous_actions[symbol] = analysis["action"]
             
-            # Her durumda timestamp güncellemesi yap
-            if time_since_last_update >= self.price_update_interval:
-                try:
-                    # Sadece timestamp'i güncelle
-                    updated = self.sheets.update_timestamp_only(row_index, analysis)
-                    if updated:
-                        self._last_update_times[symbol] = current_time
-                except Exception as e:
-                    logger.error(f"Error updating timestamp for {symbol}: {str(e)}")
-            
             return analysis
             
         except Exception as e:
@@ -1507,19 +1505,9 @@ class TradingBot:
             logger.info("Trading bot stopped by user")
             self.telegram.send_message("⚠️ *Bot Stopped*\n\nCrypto trading bot was manually stopped.")
         except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            with open("error_details.log", "a") as f:
-                f.write(f"--- {datetime.now()} ---\n")
-                f.write(f"Error type: {type(e).__name__}\n")
-                f.write(f"Error repr: {repr(e)}\n")
-                f.write(f"Error str: {str(e)}\n")
-                f.write(f"Traceback:\n{error_details}\n\n")
-            
-            logger.critical(f"Fatal error: {repr(e)}")
-            logger.critical(f"Error details saved to error_details.log")
-            # Terminate with error code
-            sys.exit(1)
+            logger.critical(f"Trading bot crashed: {str(e)}")
+            self.telegram.send_message(f"🚨 *BOT CRASHED*\n\nError: {str(e)}\n\nPlease check the log file.")
+            raise
 
 if __name__ == "__main__":
     try:
@@ -1530,16 +1518,120 @@ if __name__ == "__main__":
         bot = TradingBot()
         bot.run()
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        with open("error_details.log", "a") as f:
-            f.write(f"--- {datetime.now()} ---\n")
-            f.write(f"Error type: {type(e).__name__}\n")
-            f.write(f"Error repr: {repr(e)}\n")
-            f.write(f"Error str: {str(e)}\n")
-            f.write(f"Traceback:\n{error_details}\n\n")
-        
-        logger.critical(f"Fatal error: {repr(e)}")
-        logger.critical(f"Error details saved to error_details.log")
-        # Terminate with error code
-        sys.exit(1)
+        logger.critical(f"Fatal error: {str(e)}")
+
+EOL
+
+# strategy.py dosyasına kodun tamamını ekleyin (içerik uzun olduğu için kısaltılmış gösteriyorum)
+echo -e "${YELLOW}strategy.py dosyasını tamamlayın (kendi kodunuzu ekleyin)...${NC}"
+# Kullanıcı burada strategy.py dosyasının içeriğini manuel olarak düzenlemeli
+
+# requirements.txt dosyasını oluştur
+echo -e "${YELLOW}requirements.txt dosyası oluşturuluyor...${NC}"
+cat > $MAIN_DIR/requirements.txt << 'EOL'
+pandas
+numpy
+requests
+gspread
+python-dotenv
+tradingview-ta
+oauth2client
+EOL
+
+# .env dosyası şablonu oluştur
+echo -e "${YELLOW}.env dosyası oluşturuluyor...${NC}"
+cat > $MAIN_DIR/.env << 'EOL'
+# API Anahtarları ve Yapılandırma
+TRADINGVIEW_EXCHANGE=CRYPTO
+TRADINGVIEW_SCREENER=CRYPTO
+TRADINGVIEW_INTERVAL=1h
+
+# Google Sheets 
+GOOGLE_SHEET_ID=YOUR_SHEET_ID
+GOOGLE_CREDENTIALS_FILE=credentials.json
+GOOGLE_WORKSHEET_NAME=Trading
+
+# Telegram Bildirimleri
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+
+# Diğer Ayarlar
+TRADE_CHECK_INTERVAL=5
+BATCH_SIZE=5
+LOG_LEVEL=INFO
+EOL
+
+# Systemd servis dosyasını oluştur
+echo -e "${YELLOW}Systemd servis dosyası oluşturuluyor...${NC}"
+cat > $MAIN_DIR/trading_bot.service << 'EOL'
+[Unit]
+Description=Trading Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading_bot
+ExecStart=/home/ubuntu/trading_bot/venv/bin/python /home/ubuntu/trading_bot/strategy.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# Python sanal ortam oluştur ve paketleri yükle
+echo -e "${YELLOW}Python sanal ortamı oluşturuluyor...${NC}"
+cd $MAIN_DIR
+python3 -m venv venv || {
+    echo -e "${RED}Python sanal ortam oluşturma hatası!${NC}"
+    echo -e "${YELLOW}Python3-venv paketi kuruluyor...${NC}"
+    sudo apt-get install -y python3-venv
+    python3 -m venv venv
+}
+
+# Sanal ortamı aktifleştir
+source $MAIN_DIR/venv/bin/activate
+
+# Bağımlılıkları yükle
+echo -e "${YELLOW}Bağımlılıklar yükleniyor...${NC}"
+pip install --upgrade pip
+pip install -r $MAIN_DIR/requirements.txt
+
+# credentials.json için hatırlatma
+echo -e "${RED}ÖNEMLİ: Google Sheets API için credentials.json dosyasını yüklemelisiniz!${NC}"
+echo -e "${YELLOW}Dosyayı şu komutla yükleyebilirsiniz:${NC}"
+echo -e "scp credentials.json ubuntu@[AWS-IP-ADDRESS]:$MAIN_DIR/"
+
+# .env dosyasını düzenleme hatırlatması
+echo -e "${YELLOW}.env dosyasını kendinize göre düzenlemelisiniz. Şu komutla düzenleyebilirsiniz:${NC}"
+echo -e "nano $MAIN_DIR/.env"
+
+# Servis dosyasını kopyala
+echo -e "${YELLOW}Servis dosyası kopyalanıyor...${NC}"
+sudo cp $MAIN_DIR/trading_bot.service /etc/systemd/system/
+
+# Servis başlatma talimatları
+echo -e "${GREEN}Kurulum tamamlandı!${NC}"
+echo -e "${YELLOW}Trading Bot servisini başlatmak için şu adımları takip edin:${NC}"
+echo -e "1. Google Sheets credentials.json dosyasını $MAIN_DIR/ dizinine kopyalayın"
+echo -e "2. $MAIN_DIR/.env dosyasını kendinize göre düzenleyin"
+echo -e "3. Servisi başlatmak için şu komutları çalıştırın:"
+echo -e "   sudo systemctl daemon-reload"
+echo -e "   sudo systemctl enable trading_bot"
+echo -e "   sudo systemctl start trading_bot"
+echo -e "4. Servis durumunu kontrol etmek için:"
+echo -e "   sudo systemctl status trading_bot"
+echo -e "5. Logları izlemek için:"
+echo -e "   tail -f $MAIN_DIR/trading_bot.log"
+
+# Kullanıcıyı manuel işlemler hakkında bilgilendir
+echo -e "${RED}UNUTMAYIN:${NC} Bu script sadece kurulum ortamını hazırlar."
+echo -e "Bot'un çalışması için şunları yapmalısınız:"
+echo -e "1. strategy.py içeriğini tamamen doldurun (şu an boş bir şablon)"  
+echo -e "2. Google Sheets credentials.json dosyasını yükleyin"
+echo -e "3. .env dosyasını doğru değerlerle düzenleyin"
+echo -e "4. Servisi manuel olarak başlatın"

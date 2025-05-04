@@ -384,7 +384,7 @@ class CryptoExchangeAPI:
                 if not available_balance or available_balance == "0":
                     logger.error(f"No available balance found for {base_currency}")
                     return None
-                    
+                
                 # Convert to float and use 95% of available balance (to avoid precision issues)
                 available_balance = float(available_balance)
                 quantity = available_balance * 0.95
@@ -670,37 +670,46 @@ class CryptoExchangeAPI:
     def get_current_price(self, instrument_name):
         """Get current price for a symbol from the API"""
         try:
-            method = "public/get-ticker"
+            # Basit public API çağrısı - imza gerekmez
+            url = f"{self.account_base_url}public/get-ticker"
             
-            # For public endpoints, no signature is needed
+            # Basit parametre formatı
             params = {
                 "instrument_name": instrument_name
             }
             
-            # Send request
-            response = self.send_request(method, params)
+            logger.info(f"Getting price for {instrument_name} from {url}")
             
-            if response.get("code") == 0:
-                result = response.get("result", {})
-                data = result.get("data", [])
+            # Doğrudan HTTP GET isteği - public endpoint için imza gerekmez
+            response = requests.get(url, params=params, timeout=30)
+            
+            # Process response
+            if response.status_code == 200:
+                response_data = response.json()
                 
-                if data:
-                    # Get the latest price
-                    latest_price = float(data[0].get("a", 0))  # 'a' is the ask price
+                if response_data.get("code") == 0:
+                    result = response_data.get("result", {})
+                    data = result.get("data", [])
                     
-                    logger.info(f"Current price for {instrument_name}: {latest_price}")
-                    return latest_price
+                    if data:
+                        # Get the latest price
+                        latest_price = float(data[0].get("a", 0))  # 'a' is the ask price
+                        
+                        logger.info(f"Current price for {instrument_name}: {latest_price}")
+                        return latest_price
+                    else:
+                        logger.warning(f"No ticker data found for {instrument_name}")
                 else:
-                    logger.warning(f"No ticker data found for {instrument_name}")
+                    error_code = response_data.get("code")
+                    error_msg = response_data.get("message", response_data.get("msg", "Unknown error"))
+                    logger.error(f"API error: {error_code} - {error_msg}")
             else:
-                error_code = response.get("code")
-                error_msg = response.get("message", response.get("msg", "Unknown error"))
-                logger.error(f"API error: {error_code} - {error_msg}")
+                logger.error(f"HTTP error: {response.status_code} - {response.text}")
             
             return None
         except Exception as e:
             logger.error(f"Error getting current price for {instrument_name}: {str(e)}")
-            return None 
+            return None
 
 class GoogleSheetTradeManager:
     """Class to manage trades based on Google Sheet data"""
@@ -783,6 +792,16 @@ class GoogleSheetTradeManager:
             # Şimdilik mevcut fiyatın %3'ünü ATR olarak kabul edelim (basitleştirilmiş)
             current_price = self.exchange_api.get_current_price(symbol)
             
+            # Fiyat düzeltme kontrolü
+            coin = symbol.split('_')[0]
+            if current_price and current_price > 1000 and coin in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                logger.warning(f"ATR calculation: Price for {symbol} seems too high ({current_price}), adjusting...")
+                if current_price > 10000:
+                    current_price = current_price / 100000  # 5 sıfır bölelim
+                else:
+                    current_price = current_price / 1000    # 3 sıfır bölelim
+                logger.info(f"ATR calculation: Adjusted price to {current_price}")
+            
             if not current_price:
                 logger.warning(f"Cannot get current price for {symbol}, using default ATR")
                 # Symbol cinsinden varsayılan ATR değerleri
@@ -841,6 +860,27 @@ class GoogleSheetTradeManager:
             float: Hesaplanan stop loss değeri
         """
         try:
+            # Fiyat düzeltme kontrolü
+            coin = symbol.split('_')[0]
+            original_entry = entry_price
+            
+            if entry_price > 1000 and coin in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                logger.warning(f"Stop Loss calculation: Entry price for {symbol} seems too high ({entry_price}), adjusting...")
+                if entry_price > 10000:
+                    entry_price = entry_price / 100000  # 5 sıfır bölelim
+                else:
+                    entry_price = entry_price / 1000    # 3 sıfır bölelim
+                logger.info(f"Stop Loss calculation: Adjusted entry price from {original_entry} to {entry_price}")
+                
+            # Swing Low'u da düzelt
+            if swing_low and swing_low > 1000 and coin in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                original_swing = swing_low
+                if swing_low > 10000:
+                    swing_low = swing_low / 100000  # 5 sıfır bölelim
+                else:
+                    swing_low = swing_low / 1000    # 3 sıfır bölelim
+                logger.info(f"Stop Loss calculation: Adjusted swing low from {original_swing} to {swing_low}")
+            
             # ATR hesapla
             atr = self.calculate_atr(symbol, self.atr_period)
             
@@ -882,6 +922,27 @@ class GoogleSheetTradeManager:
             float: Hesaplanan take profit değeri
         """
         try:
+            # Fiyat düzeltme kontrolü
+            coin = symbol.split('_')[0]
+            original_entry = entry_price
+            
+            if entry_price > 1000 and coin in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                logger.warning(f"Take Profit calculation: Entry price for {symbol} seems too high ({entry_price}), adjusting...")
+                if entry_price > 10000:
+                    entry_price = entry_price / 100000  # 5 sıfır bölelim
+                else:
+                    entry_price = entry_price / 1000    # 3 sıfır bölelim
+                logger.info(f"Take Profit calculation: Adjusted entry price from {original_entry} to {entry_price}")
+                
+            # Direnç seviyesini de düzelt
+            if resistance_level and resistance_level > 1000 and coin in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                original_res = resistance_level
+                if resistance_level > 10000:
+                    resistance_level = resistance_level / 100000  # 5 sıfır bölelim
+                else:
+                    resistance_level = resistance_level / 1000    # 3 sıfır bölelim
+                logger.info(f"Take Profit calculation: Adjusted resistance level from {original_res} to {resistance_level}")
+            
             # ATR hesapla
             atr = self.calculate_atr(symbol, self.atr_period)
             
@@ -906,6 +967,38 @@ class GoogleSheetTradeManager:
             logger.error(f"Error calculating take profit for {symbol}: {str(e)}")
             # Default olarak giriş fiyatının %10 üstü
             return entry_price * 1.10
+    
+    def parse_number(self, value_str):
+        """
+        Sheet'ten alınan sayısal değerleri doğru şekilde dönüştüren yardımcı fonksiyon
+        Türkçe formatı (virgül) ve diğer formatları düzgün işler
+        """
+        try:
+            if not value_str or value_str.strip() == '':
+                return 0.0
+                
+            # Temizle ve normalize et
+            value_str = str(value_str).strip().replace(' ', '')
+            
+            # Türkçe formatı: virgül ondalık ayırıcı, nokta binlik ayırıcı olabilir
+            if ',' in value_str:
+                # Virgülü noktaya çevir
+                value_str = value_str.replace('.', '').replace(',', '.')
+            
+            # Sayıya dönüştür
+            value = float(value_str)
+            
+            # Çok büyük değerleri kontrol et - muhtemelen yanlış format
+            # Örneğin 3,62 yerine 362 olarak okunmuş olabilir
+            if value > 100 and ',' in str(value_str):
+                # Orijinal değer muhtemelen 3,62 gibi bir şeydi, düzelt
+                return value / 10.0
+                
+            return value
+            
+        except Exception as e:
+            logger.error(f"Error parsing number '{value_str}': {str(e)}")
+            return 0.0
     
     def get_trade_signals(self):
         """Get coins marked for trading from Google Sheet"""
@@ -949,43 +1042,71 @@ class GoogleSheetTradeManager:
                 if buy_signal == 'BUY':
                     # Get additional data for trade - handle European number format (comma as decimal separator)
                     try:
-                        # Get real-time price from API
+                        # Get real-time price from API - her zaman API fiyatını kullan
                         api_price = self.exchange_api.get_current_price(formatted_pair)
                         
-                        # If API price is available, use it, otherwise fall back to sheet price
-                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
-                        if not sheet_price_str or sheet_price_str.strip() == '':
-                            sheet_price_str = '0'
-                            
-                        if api_price is not None:
-                            last_price = api_price
-                            logger.info(f"Using real-time API price for {symbol}: {last_price}")
-                        else:
-                            last_price = float(sheet_price_str)
-                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
+                        if api_price is None:
+                            logger.error(f"Could not get real-time price for {symbol}, skipping")
+                            continue
                         
-                        # Get Resistance Up and Resistance Down values - properly handle European format
-                        resistance_up_str = str(row.get('Resistance Up', '0')).replace(',', '.')
-                        resistance_down_str = str(row.get('Resistance Down', '0')).replace(',', '.')
+                        # API fiyatını last_price olarak ayarla
+                        last_price = api_price    
+                        logger.info(f"Using real-time API price for {symbol}: {last_price}")
                         
-                        if not resistance_up_str or resistance_up_str.strip() == '':
-                            resistance_up_str = '0'
-                        if not resistance_down_str or resistance_down_str.strip() == '':
-                            resistance_down_str = '0'
-                            
-                        # Convert to float
-                        resistance_up = float(resistance_up_str)
-                        resistance_down = float(resistance_down_str)
+                        # FİYAT DÜZELTMESİ: Çok yüksek değerler için fiyatı düzelt
+                        original_price = last_price
+                        if last_price > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            logger.warning(f"Price for {symbol} seems too high ({last_price}), might be a decimal place error. Adjusting...")
+                            if last_price > 10000:
+                                last_price = last_price / 100000  # 5 sıfır bölelim
+                            else:
+                                last_price = last_price / 1000    # 3 sıfır bölelim
+                            logger.info(f"Adjusted price from {original_price} to {last_price}")
+                        
+                        # Get Resistance Up and Resistance Down values with proper number parsing
+                        resistance_up = self.parse_number(row.get('Resistance Up', '0'))
+                        resistance_down = self.parse_number(row.get('Resistance Down', '0'))
+                        
+                        logger.info(f"Parsed resistance values: Up={resistance_up}, Down={resistance_down}")
+                        
+                        # Resistance değerlerini de düzelt
+                        if resistance_up > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            if resistance_up > 10000:
+                                resistance_up = resistance_up / 100000
+                            else:
+                                resistance_up = resistance_up / 1000
+                            logger.info(f"Adjusted resistance up to {resistance_up}")
+                        
+                        if resistance_down > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            if resistance_down > 10000:
+                                resistance_down = resistance_down / 100000
+                            else:
+                                resistance_down = resistance_down / 1000
+                            logger.info(f"Adjusted resistance down to {resistance_down}")
                         
                         # Get buy target if available (or use last price)
-                        buy_target_str = str(row.get('Buy Target', '0')).replace(',', '.')
-                        if not buy_target_str or buy_target_str.strip() == '':
+                        buy_target = self.parse_number(row.get('Buy Target', '0'))
+                        if buy_target == 0:
                             buy_target = last_price
-                        else:
-                            buy_target = float(buy_target_str)
+                            
+                        logger.info(f"Parsed buy target: {buy_target}")
+                            
+                        # Buy Target'ı da düzelt
+                        if buy_target > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            if buy_target > 10000:
+                                buy_target = buy_target / 100000
+                            else:
+                                buy_target = buy_target / 1000
+                            logger.info(f"Adjusted buy target to {buy_target}")
                         
                         # ATR tabanlı Stop Loss ve Take Profit hesapla
-                        entry_price = buy_target  # Alış fiyatı
+                        entry_price = last_price  # Alış fiyatı - güncel fiyatı kullan
+                        
+                        # Take Profit ve Stop Loss değerlerini doğrudan sheet'ten al (varsa)
+                        sheet_take_profit = self.parse_number(row.get('Take Profit', '0'))
+                        sheet_stop_loss = self.parse_number(row.get('Stop-Loss', '0'))
+                        
+                        logger.info(f"Sheet values - TP: {sheet_take_profit}, SL: {sheet_stop_loss}")
                         
                         # Swing Low için Resistance Down'u kullan (Support seviyesi olarak)
                         swing_low = resistance_down if resistance_down > 0 else None
@@ -993,14 +1114,40 @@ class GoogleSheetTradeManager:
                         # Resistance Up'ı direnç seviyesi olarak kullan
                         resistance_level = resistance_up if resistance_up > 0 else None
                         
-                        # Stop Loss ve Take Profit hesapla
-                        stop_loss = self.calculate_stop_loss(formatted_pair, entry_price, swing_low)
-                        take_profit = self.calculate_take_profit(formatted_pair, entry_price, resistance_level)
+                        # Önce sheet değerlerini kontrol et, yoksa hesapla
+                        if sheet_take_profit > 0:
+                            take_profit = sheet_take_profit
+                            logger.info(f"Using Take Profit from sheet: {take_profit}")
+                        else:
+                            take_profit = self.calculate_take_profit(formatted_pair, entry_price, resistance_level)
+                            
+                        if sheet_stop_loss > 0:
+                            stop_loss = sheet_stop_loss
+                            logger.info(f"Using Stop Loss from sheet: {stop_loss}")
+                        else:
+                            stop_loss = self.calculate_stop_loss(formatted_pair, entry_price, swing_low)
                         
-                        logger.info(f"ATR-based values for {symbol}: stop_loss={stop_loss}, take_profit={take_profit}")
+                        # TP ve SL için de fiyat düzeltme kontrolü
+                        if stop_loss > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            orig_stop_loss = stop_loss
+                            if stop_loss > 10000:
+                                stop_loss = stop_loss / 100000
+                            else:
+                                stop_loss = stop_loss / 1000
+                            logger.info(f"Adjusted stop loss from {orig_stop_loss} to {stop_loss}")
+                            
+                        if take_profit > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            orig_take_profit = take_profit
+                            if take_profit > 10000:
+                                take_profit = take_profit / 100000
+                            else:
+                                take_profit = take_profit / 1000
+                            logger.info(f"Adjusted take profit from {orig_take_profit} to {take_profit}")
+                        
+                        logger.info(f"FINAL values for {symbol}: stop_loss={stop_loss}, take_profit={take_profit}")
                         
                         # Log parsed values for debugging
-                        logger.debug(f"Parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
+                        logger.debug(f"FINAL parsed values for {symbol}: last_price={last_price}, buy_target={buy_target}, " +
                                     f"take_profit={take_profit}, stop_loss={stop_loss}, " +
                                     f"resistance_up={resistance_up}, resistance_down={resistance_down}")
                     except ValueError as e:
@@ -1023,20 +1170,26 @@ class GoogleSheetTradeManager:
                     
                     # For SELL signals, also get real-time price
                     try:
-                        # Get real-time price from API
+                        # Get real-time price from API - her zaman API fiyatını kullan
                         api_price = self.exchange_api.get_current_price(formatted_pair)
                         
-                        # If API price is available, use it, otherwise fall back to sheet price
-                        sheet_price_str = str(row.get('Last Price', '0')).replace(',', '.')
-                        if not sheet_price_str or sheet_price_str.strip() == '':
-                            sheet_price_str = '0'
+                        if api_price is None:
+                            logger.error(f"Could not get real-time price for SELL signal {symbol}, skipping")
+                            continue
                             
-                        if api_price is not None:
-                            last_price = api_price
-                            logger.info(f"Using real-time API price for SELL signal {symbol}: {last_price}")
-                        else:
-                            last_price = float(sheet_price_str)
-                            logger.warning(f"Real-time API price not available for {symbol}, using sheet price: {last_price}")
+                        # API fiyatını last_price olarak ayarla
+                        last_price = api_price
+                        logger.info(f"Using real-time API price for SELL signal {symbol}: {last_price}")
+                            
+                        # FİYAT DÜZELTMESİ: Çok yüksek değerler için fiyatı düzelt
+                        original_price = last_price
+                        if last_price > 1000 and symbol in ["SUI", "DOGE", "BONK", "SHIB", "PEPE"]:
+                            logger.warning(f"SELL Price for {symbol} seems too high ({last_price}), might be a decimal place error. Adjusting...")
+                            if last_price > 10000:
+                                last_price = last_price / 100000  # 5 sıfır bölelim
+                            else:
+                                last_price = last_price / 1000    # 3 sıfır bölelim
+                            logger.info(f"Adjusted SELL price from {original_price} to {last_price}")
                             
                         logger.debug(f"SELL signal for {symbol} at price {last_price}")
                     except ValueError as e:
@@ -1057,7 +1210,7 @@ class GoogleSheetTradeManager:
                 
         except Exception as e:
             logger.error(f"Error getting trade signals: {str(e)}")
-            return []
+            return [] 
 
     def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None, stop_loss=None, take_profit=None):
         """Update trade status in Google Sheet"""
@@ -1130,11 +1283,23 @@ class GoogleSheetTradeManager:
                 
                 # Update Take Profit and Stop Loss columns
                 if take_profit:
+                    # Değeri kontrol et, çok büyükse (>100) düzelt
+                    if take_profit > 100 and isinstance(take_profit, (int, float)):
+                        logger.warning(f"Take Profit değeri çok büyük görünüyor: {take_profit}, düzeltiliyor")
+                        take_profit = take_profit / 10
+                        logger.info(f"Düzeltilmiş Take Profit: {take_profit}")
+                        
                     formatted_tp = format_number_for_sheet(take_profit)
                     self.worksheet.update_cell(row_index, 6, formatted_tp)
                     logger.info(f"Updated Take Profit: {take_profit} as {formatted_tp}")
                     
                 if stop_loss:
+                    # Değeri kontrol et, çok büyükse (>100) düzelt
+                    if stop_loss > 100 and isinstance(stop_loss, (int, float)):
+                        logger.warning(f"Stop Loss değeri çok büyük görünüyor: {stop_loss}, düzeltiliyor")
+                        stop_loss = stop_loss / 10
+                        logger.info(f"Düzeltilmiş Stop Loss: {stop_loss}")
+                        
                     formatted_sl = format_number_for_sheet(stop_loss)
                     self.worksheet.update_cell(row_index, 7, formatted_sl)
                     logger.info(f"Updated Stop Loss: {stop_loss} as {formatted_sl}")
@@ -1221,6 +1386,281 @@ class GoogleSheetTradeManager:
             logger.error(f"Error updating trade status: {str(e)}")
             return False
     
+    def place_tp_sl_orders(self, symbol, quantity, entry_price, take_profit, stop_loss, row_index):
+        """
+        TP ve SL için otomatik satış emirleri oluşturur
+        
+        Parameters:
+            symbol (str): İşlem çifti (örn. BTC_USDT)
+            quantity (float): Satılacak miktar
+            entry_price (float): Giriş fiyatı
+            take_profit (float): Take profit fiyatı
+            stop_loss (float): Stop loss fiyatı
+            row_index (int): Google Sheet satır indeksi
+        
+        Returns:
+            tuple: (tp_order_id, sl_order_id) veya None
+        """
+        try:
+            logger.info(f"Placing TP/SL orders for {symbol}: TP={take_profit}, SL={stop_loss}")
+            
+            # Base currency (coin adı)
+            base_currency = symbol.split('_')[0]
+            
+            # Orijinal miktarı logla
+            logger.info(f"Original quantity for {symbol}: {quantity}")
+            
+            # Daha önceki mantıktan uyarlanan coin-spesifik miktar formatlaması
+            # Her birimin kendine özgü gereksinimlerine göre formatla
+            original_quantity = quantity
+            
+            # Miktar kontrolü
+            if quantity <= 0:
+                logger.error(f"Invalid quantity for {symbol}: {quantity}")
+                return None, None
+                
+            # Gerçek bakiyeyi kontrol et
+            actual_balance = self.exchange_api.get_coin_balance(base_currency)
+            if actual_balance:
+                try:
+                    actual_balance_float = float(actual_balance)
+                    if actual_balance_float < quantity:
+                        logger.warning(f"Actual balance ({actual_balance_float}) is less than expected quantity ({quantity}). Using actual balance.")
+                        quantity = actual_balance_float * 0.99  # %99'unu kullan
+                except Exception as e:
+                    logger.error(f"Error converting balance to float: {str(e)}")
+            
+            # DÜZELTME: Asla çok küçük değerleri integer'a dönüştürme
+            if base_currency == "SUI":
+                # SUI için ondalık miktar kullan, integer'a dönüştürme
+                formatted_quantity = "{:.2f}".format(quantity).rstrip('0').rstrip('.')
+                if float(formatted_quantity) == 0:
+                    formatted_quantity = "{:.2f}".format(quantity)  # Tüm ondalıkları koru
+                logger.info(f"Using decimal format for SUI: {formatted_quantity}")
+            elif base_currency in ["BONK", "SHIB", "DOGE", "PEPE"]:
+                # Meme coinler için yüksek miktarlarda tam sayı, küçük miktarlarda ondalık kullan
+                if quantity > 1:
+                    formatted_quantity = "{:.2f}".format(quantity)
+                else:
+                    formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using adaptive format for meme coin {base_currency}: {formatted_quantity}")
+            elif base_currency in ["BTC", "ETH", "SOL"]:
+                # Büyük coinler için 2 decimal kullan
+                formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using 2 decimal places for {base_currency}: {formatted_quantity}")
+            else:
+                # Diğer coinler için 2 decimal format
+                formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using 2 decimal format for {base_currency}: {formatted_quantity}")
+            
+            # Satış miktarı doğru formatlandı mı kontrol et
+            if float(formatted_quantity) <= 0:
+                logger.error(f"Invalid formatted quantity: {formatted_quantity} for {symbol}")
+                return None, None
+            
+            # Google Sheet'te TP ve SL değerlerini güncelle
+            self.update_trade_status(
+                row_index,
+                "UPDATE_TP_SL",
+                take_profit=take_profit,
+                stop_loss=stop_loss
+            )
+            
+            # Not: Crypto.com Exchange'in TAKE_PROFIT ve STOP_LOSS emirleri için API desteğine göre
+            # burada TP ve SL için satış emirleri oluşturulmalıdır.
+            
+            tp_order_id = None
+            sl_order_id = None
+            
+            try:
+                # Miktarı ikiye bölmeye gerek yok, tam miktarı kullan
+                logger.info(f"Using full quantity for orders: {formatted_quantity}")
+                
+                if float(formatted_quantity) <= 0:
+                    logger.error(f"Quantity became zero or negative after formatting. Original: {quantity}, Formatted: {formatted_quantity}")
+                    return None, None
+                
+                # Take Profit için TAKE_PROFIT satış emri oluştur
+                tp_params = {
+                    "instrument_name": symbol,
+                    "side": "SELL",
+                    "type": "TAKE_PROFIT",
+                    "price": "{:.2f}".format(take_profit),
+                    "quantity": formatted_quantity,
+                    "ref_price": "{:.2f}".format(take_profit),
+                    "ref_price_type": "MARK_PRICE"
+                }
+                
+                tp_response = self.exchange_api.send_request("private/create-order", tp_params)
+                
+                if tp_response and tp_response.get("code") == 0:
+                    tp_order_id = tp_response["result"]["order_id"]
+                    logger.info(f"Successfully placed TP order for {symbol} at {take_profit}, order ID: {tp_order_id}")
+                else:
+                    logger.error(f"Failed to place TP order: {tp_response}")
+                    
+                    # Farklı bir format dene - belki sadece LIMIT tipi çalışıyordur
+                    logger.info(f"Trying with LIMIT order type for TP")
+                    tp_params["type"] = "LIMIT"
+                    # ref_price parametrelerini kaldır
+                    if "ref_price" in tp_params:
+                        del tp_params["ref_price"]
+                    if "ref_price_type" in tp_params:
+                        del tp_params["ref_price_type"]
+                    
+                    tp_retry_response = self.exchange_api.send_request("private/create-order", tp_params)
+                    
+                    if tp_retry_response and tp_retry_response.get("code") == 0:
+                        tp_order_id = tp_retry_response["result"]["order_id"]
+                        logger.info(f"Successfully placed TP order with LIMIT type, order ID: {tp_order_id}")
+                    
+                # Stop Loss için STOP_LOSS satış emri oluştur
+                sl_params = {
+                    "instrument_name": symbol,
+                    "side": "SELL",
+                    "type": "STOP_LOSS",
+                    "price": "{:.2f}".format(stop_loss),
+                    "quantity": formatted_quantity,
+                    "ref_price": "{:.2f}".format(stop_loss),
+                    "ref_price_type": "MARK_PRICE"
+                }
+                
+                sl_response = self.exchange_api.send_request("private/create-order", sl_params)
+                
+                if sl_response and sl_response.get("code") == 0:
+                    sl_order_id = sl_response["result"]["order_id"]
+                    logger.info(f"Successfully placed SL order for {symbol} at {stop_loss}, order ID: {sl_order_id}")
+                else:
+                    logger.error(f"Failed to place SL order: {sl_response}")
+                    
+                    # Farklı bir format dene - belki sadece LIMIT tipi çalışıyordur
+                    logger.info(f"Trying with LIMIT order type for SL")
+                    sl_params["type"] = "LIMIT"
+                    # ref_price parametrelerini kaldır
+                    if "ref_price" in sl_params:
+                        del sl_params["ref_price"]
+                    if "ref_price_type" in sl_params:
+                        del sl_params["ref_price_type"]
+                    
+                    sl_retry_response = self.exchange_api.send_request("private/create-order", sl_params)
+                    
+                    if sl_retry_response and sl_retry_response.get("code") == 0:
+                        sl_order_id = sl_retry_response["result"]["order_id"]
+                        logger.info(f"Successfully placed SL order with LIMIT type, order ID: {sl_order_id}")
+                
+                # TP ve SL order ID'lerini pozisyon takip bilgilerine kaydet
+                return tp_order_id, sl_order_id
+                
+            except Exception as e:
+                logger.error(f"Error placing TP/SL orders for {symbol}: {str(e)}")
+                return None, None
+                
+        except Exception as e:
+            logger.error(f"Error in place_tp_sl_orders for {symbol}: {str(e)}")
+            return None, None
+    
+    def monitor_position(self, symbol, order_id):
+        """Monitor a position and its associated orders"""
+        try:
+            logger.info(f"Starting to monitor position for {symbol} with order ID {order_id}")
+            
+            # Wait for order to be filled
+            status = None
+            max_checks = 30  # Daha fazla kontrol yapılsın
+            checks = 0
+            
+            while checks < max_checks:
+                # Get order details
+                method = "private/get-order-detail"
+                params = {"order_id": order_id}
+                order_detail = self.exchange_api.send_request(method, params)
+                
+                if order_detail and order_detail.get("code") == 0:
+                    result = order_detail.get("result", {})
+                    status = result.get("status")
+                    cumulative_quantity = float(result.get("cumulative_quantity", 0))
+                    
+                    logger.info(f"Order {order_id} status: {status}, cumulative_quantity: {cumulative_quantity}")
+                    
+                    # Emir FILLED veya kısmen gerçekleşmiş ise (miktar > 0)
+                    if status == "FILLED" or (status in ["CANCELED", "REJECTED", "EXPIRED"] and cumulative_quantity > 0):
+                        logger.info(f"Order {order_id} is {status} with executed quantity: {cumulative_quantity}")
+                        
+                        # Mark position as active
+                        if symbol in self.active_positions:
+                            self.active_positions[symbol]['status'] = 'POSITION_ACTIVE'
+                            logger.info(f"Position for {symbol} is now active")
+                        
+                            # Gerçek satın alınan miktarı al
+                            try:
+                                if "cumulative_quantity" in result:
+                                    actual_quantity = float(result.get("cumulative_quantity"))
+                                    # Gerçek miktarı güncelle
+                                    self.active_positions[symbol]['quantity'] = actual_quantity
+                                    logger.info(f"Updated actual quantity for {symbol}: {actual_quantity}")
+                                if "avg_price" in result:
+                                    actual_price = float(result.get("avg_price"))
+                                    # Gerçek fiyatı güncelle
+                                    self.active_positions[symbol]['price'] = actual_price
+                                    logger.info(f"Updated actual price for {symbol}: {actual_price}")
+                            except Exception as e:
+                                logger.error(f"Error getting actual quantity: {str(e)}")
+                        
+                        # Pozisyon aktif, işlem tamamlandı (tam veya kısmi dolum)
+                        return True
+                    elif status in ["CANCELED", "REJECTED", "EXPIRED"] and cumulative_quantity == 0:
+                        logger.warning(f"Order {order_id} is {status} with no executed quantity")
+                        
+                        # Pozisyonu temizle
+                        if symbol in self.active_positions:
+                            del self.active_positions[symbol]
+                            logger.info(f"Position for {symbol} removed due to {status} order with no execution")
+                        
+                        return False
+                
+                # Bekle ve tekrar kontrol et
+                time.sleep(5)
+                checks += 1
+            
+            logger.warning(f"Monitoring timed out for order {order_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error monitoring position for {symbol}: {str(e)}")
+            return False
+    
+    def monitor_sell_order(self, symbol, order_id, row_index):
+        """Monitor a sell order until it's filled or cancelled"""
+        try:
+            logger.info(f"Starting to monitor sell order for {symbol} with ID {order_id}")
+            
+            # Wait for order to be filled
+            status = None
+            max_checks = 10
+            checks = 0
+            
+            while checks < max_checks:
+                status = self.exchange_api.get_order_status(order_id)
+                logger.info(f"Sell order {order_id} status: {status}")
+                
+                if status == "FILLED":
+                    logger.info(f"Sell order {order_id} is filled")
+                    return True
+                elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                    logger.warning(f"Sell order {order_id} is {status}")
+                    return False
+                
+                # Bekle ve tekrar kontrol et
+                time.sleep(5)
+                checks += 1
+            
+            logger.warning(f"Monitoring timed out for sell order {order_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error monitoring sell order for {symbol}: {str(e)}")
+            return False
+    
     def execute_trade(self, trade_signal):
         """Execute a trade based on the signal"""
         symbol = trade_signal['symbol']
@@ -1233,8 +1673,23 @@ class GoogleSheetTradeManager:
             take_profit = float(trade_signal['take_profit'])
             stop_loss = float(trade_signal['stop_loss'])
             
-            # Basit fiyat bilgisi için sadece last_price kullan (sadece loglama ve sheet için)
-            price = float(trade_signal['last_price'])
+            # Her zaman güncel fiyatı API'den al
+            current_price = self.exchange_api.get_current_price(symbol)
+            if not current_price:
+                logger.error(f"Could not get current price for {symbol}, skipping buy")
+                return False
+                
+            price = current_price
+            
+            # Fiyat kontrolü - çok büyük değerler için düzeltme
+            if price > 1000:  # SUI genellikle 1000 USDT'den düşük olmalı
+                logger.warning(f"Price seems too high ({price}), might be a decimal place error. Adjusting...")
+                # SUI yaklaşık 1-2 USDT arası olduğundan, 1000'den büyük değerleri bölelim
+                if price > 10000:
+                    price = price / 100000  # 5 sıfır bölelim
+                else:
+                    price = price / 1000    # 3 sıfır bölelim
+                logger.info(f"Adjusted price to {price}")
             
             # Check if we have an active position for this symbol
             if symbol in self.active_positions:
@@ -1263,6 +1718,7 @@ class GoogleSheetTradeManager:
                 
                 # Quantity için varsayılan değer (sheet güncellemesi için)
                 estimated_quantity = trade_amount / price if price > 0 else 0
+                logger.info(f"Estimated quantity: {estimated_quantity} (${trade_amount} / {price})")
                 
                 # Update trade status in sheet including order_id, stop_loss and take_profit
                 self.update_trade_status(
@@ -1279,7 +1735,7 @@ class GoogleSheetTradeManager:
                 self.active_positions[symbol] = {
                     'order_id': order_id,
                     'row_index': row_index,
-                    'quantity': estimated_quantity,  # Tahmini miktar
+                    'quantity': estimated_quantity,  # Başlangıçta tahmini miktar kullanılıyor
                     'price': price,
                     'stop_loss': stop_loss,
                     'take_profit': take_profit,
@@ -1287,15 +1743,51 @@ class GoogleSheetTradeManager:
                     'status': 'ORDER_PLACED'
                 }
                 
-                # Start monitoring thread for this order
-                monitor_thread = threading.Thread(
-                    target=self.monitor_position,
-                    args=(symbol, order_id),
-                    daemon=True
-                )
-                monitor_thread.start()
+                # ÖNEMLİ DEĞİŞİKLİK: Önce alım emrinin filled olmasını bekle
+                # Sonra gerçek miktarı kullanarak TP/SL emirlerini oluştur
+                logger.info(f"Waiting for BUY order {order_id} to be filled before placing TP/SL orders")
+                is_filled = self.monitor_position(symbol, order_id)
                 
-                return True
+                if is_filled and symbol in self.active_positions:
+                    # Gerçek miktarı ve fiyatı kullan (monitor_position'da güncellendi)
+                    actual_quantity = self.active_positions[symbol].get('quantity', estimated_quantity)
+                    actual_price = self.active_positions[symbol].get('price', price)
+                    
+                    logger.info(f"BUY order filled! Using actual quantity ({actual_quantity}) for TP/SL orders")
+                    
+                    # Gerçek miktar kullanarak TP/SL emirlerini oluştur
+                    tp_order_id, sl_order_id = self.place_tp_sl_orders(
+                        symbol, 
+                        actual_quantity,  # Gerçek satın alınan miktar
+                        actual_price,     # Gerçek satın alım fiyatı 
+                        take_profit, 
+                        stop_loss, 
+                        row_index
+                    )
+                    
+                    # Sipariş ID'lerini pozisyon bilgilerimize kaydet
+                    if tp_order_id or sl_order_id:
+                        self.active_positions[symbol]['tp_order_id'] = tp_order_id
+                        self.active_positions[symbol]['sl_order_id'] = sl_order_id
+                        logger.info(f"TP/SL orders created for {symbol}: TP={tp_order_id}, SL={sl_order_id}")
+                        
+                        # TP/SL notlarını Google Sheet'e ekle
+                        try:
+                            # Mevcut notları al
+                            current_notes = self.worksheet.cell(row_index, 17).value or ""
+                            tp_sl_notes = f"TP Order: {tp_order_id or 'Failed'}, SL Order: {sl_order_id or 'Failed'}"
+                            new_notes = f"{current_notes} | {tp_sl_notes}" if current_notes else tp_sl_notes
+                            self.worksheet.update_cell(row_index, 17, new_notes)
+                        except Exception as e:
+                            logger.error(f"Error updating Notes with TP/SL orders: {str(e)}")
+                else:
+                    logger.warning(f"BUY order was not filled, cannot place TP/SL orders")
+                    # Eğer pozisyon hala aktivse ama filled değilse, pozisyonu kaldır
+                    if symbol in self.active_positions and self.active_positions[symbol]['status'] != 'POSITION_ACTIVE':
+                        del self.active_positions[symbol]
+                        logger.info(f"Removed position for {symbol} due to unfilled order")
+                
+                return is_filled
                     
             except Exception as e:
                 logger.error(f"Error executing buy trade for {symbol}: {str(e)}")
@@ -1312,7 +1804,25 @@ class GoogleSheetTradeManager:
                 if symbol in self.active_positions:
                     # Get position details from our tracking system
                     position = self.active_positions[symbol]
-                    quantity = position['quantity']
+                    quantity = position['quantity']  # Bu önemli satır eksikti!
+                    
+                    # YENİ: Eğer TP/SL emirleri varsa iptal et
+                    if 'tp_order_id' in position and position['tp_order_id']:
+                        try:
+                            cancel_params = {"order_id": position['tp_order_id']}
+                            self.exchange_api.send_request("private/cancel-order", cancel_params)
+                            logger.info(f"Cancelled TP order {position['tp_order_id']} for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Error cancelling TP order: {str(e)}")
+                    
+                    if 'sl_order_id' in position and position['sl_order_id']:
+                        try:
+                            cancel_params = {"order_id": position['sl_order_id']}
+                            self.exchange_api.send_request("private/cancel-order", cancel_params)
+                            logger.info(f"Cancelled SL order {position['sl_order_id']} for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Error cancelling SL order: {str(e)}")
+                    
                     logger.info(f"Found active position for {symbol}, selling {quantity} at {price}")
                 else:
                     # Try to get the position based on order_id from the sheet
@@ -1436,7 +1946,7 @@ class GoogleSheetTradeManager:
             except Exception as e:
                 logger.error(f"Error executing sell for {symbol}: {str(e)}")
                 return False
-    
+
     def calculate_trailing_stop(self, symbol, current_price, position):
         """
         Calculate trailing stop based on ATR and current price
@@ -1552,12 +2062,12 @@ class GoogleSheetTradeManager:
                                 # Check for stop loss hit (including trailing stop)
                                 if current_price <= position['stop_loss']:
                                     logger.info(f"Stop loss triggered for {symbol} at {current_price} (stop_loss: {position['stop_loss']})")
-                                    self.execute_sell(symbol, current_price)
+                                    self.execute_trade({'symbol': symbol, 'action': 'SELL', 'last_price': current_price, 'row_index': row_index, 'original_symbol': symbol.split('_')[0]})
                                 
                                 # Check for take profit hit
                                 elif 'take_profit' in position and current_price >= position['take_profit']:
                                     logger.info(f"Take profit triggered for {symbol} at {current_price} (take_profit: {position['take_profit']})")
-                                    self.execute_sell(symbol, current_price)
+                                    self.execute_trade({'symbol': symbol, 'action': 'SELL', 'last_price': current_price, 'row_index': row_index, 'original_symbol': symbol.split('_')[0]})
                         except Exception as e:
                             logger.error(f"Error checking take profit/stop loss for {symbol}: {str(e)}")
                 
