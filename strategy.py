@@ -59,6 +59,13 @@ class TradingViewDataProvider:
         }
         self.interval = interval_map.get(interval_str, Interval.INTERVAL_1_HOUR)
         
+        # ATR için parametre değerleri
+        self.atr_period = int(os.getenv("ATR_PERIOD", "14"))  # Default ATR period
+        self.atr_multiplier = float(os.getenv("ATR_MULTIPLIER", "2.0"))  # Default ATR multiplier
+        
+        # ATR verilerini saklamak için cache oluştur
+        self.atr_cache = {}  # {symbol: {'atr': value, 'timestamp': last_update_time}}
+        
         logger.info(f"Initialized TradingView with exchange: {self.exchange}, interval: {self.interval}")
     
     def _format_symbol(self, symbol):
@@ -208,9 +215,9 @@ class TradingViewDataProvider:
         # Count how many MA conditions are valid
         valid_ma_count = sum([data["ma200_valid"], data["ma50_valid"], data["ema10_valid"]])
         
-        # Buy signal: RSI < 45 (more relaxed) and at least 2 MA conditions are valid
+        # Buy signal: RSI < 40 (more conservative) and at least 2 MA conditions are valid
         data["buy_signal"] = (
-            data["rsi"] < 45 and
+            data["rsi"] < 40 and
             valid_ma_count >= 2
         )
         
@@ -220,10 +227,55 @@ class TradingViewDataProvider:
             data["last_price"] > data["resistance"]
         )
         
-        # Calculate take profit and stop loss using ATR
-        data["take_profit"] = data["last_price"] + (data["atr"] * 3)
-        data["stop_loss"] = data["last_price"] - (data["atr"] * 1.5)
+        # ATR tabanlı Stop Loss ve Take Profit hesaplaması
+        entry_price = data["last_price"]
         
+        # TP ve SL için kullanılacak direnç ve destek seviyeleri
+        resistance_level = data["resistance"] if data["resistance"] > 0 else None
+        support_level = data["support"] if data["support"] > 0 else None
+        
+        # Stop Loss hesaplama - ATR tabanlı
+        if not data["atr"] or data["atr"] == 0:
+            # ATR değeri yoksa basit hesaplama kullan
+            stop_loss = entry_price * 0.95  # %5 altında
+        else:
+            # ATR tabanlı hesaplama
+            atr_stop_loss = entry_price - (data["atr"] * self.atr_multiplier)
+            
+            # Eğer destek seviyesi varsa, ikisinden daha düşük olanı kullan
+            if support_level and support_level < entry_price:
+                stop_loss = min(atr_stop_loss, support_level)
+                # Destek seviyesine %1'lik buffer ekle
+                stop_loss = stop_loss * 0.99
+            else:
+                stop_loss = atr_stop_loss
+        
+        # Take Profit hesaplama - ATR tabanlı
+        if not data["atr"] or data["atr"] == 0:
+            # ATR değeri yoksa basit hesaplama kullan
+            take_profit = entry_price * 1.10  # %10 üstünde
+        else:
+            # ATR tabanlı minimum TP mesafesi
+            minimum_tp_distance = entry_price + (data["atr"] * self.atr_multiplier)
+            
+            # Eğer direnç seviyesi varsa ve minimum mesafeden büyükse onu kullan
+            if resistance_level and resistance_level > minimum_tp_distance:
+                take_profit = resistance_level
+            else:
+                take_profit = minimum_tp_distance
+        
+        # TP ve SL değerlerini ekle
+        data["take_profit"] = take_profit
+        data["stop_loss"] = stop_loss
+        
+        # Risk/Ödül oranını hesapla
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+        if risk > 0:
+            data["risk_reward_ratio"] = round(reward / risk, 2)  # Ör: 2.5 (2.5:1 ödül:risk oranı)
+        else:
+            data["risk_reward_ratio"] = 0
+            
         # Set action based on signals
         if data["buy_signal"]:
             data["action"] = "BUY"
@@ -987,8 +1039,18 @@ class TelegramNotifier:
         message += f"• Price: {data['last_price']:.8f}\n"
         message += f"• RSI: {data['rsi']:.2f}\n"
         
+        # ATR tabanlı TP/SL detayları
         message += f"• Take Profit: {data['take_profit']:.8f}\n"
         message += f"• Stop Loss: {data['stop_loss']:.8f}\n"
+        
+        # Risk/Ödül oranı bilgisini ekle
+        if "risk_reward_ratio" in data and data["risk_reward_ratio"] > 0:
+            message += f"• Risk/Reward: {data['risk_reward_ratio']}:1\n"
+            
+        # ATR bilgisini ekle
+        if "atr" in data and data["atr"] > 0:
+            message += f"• ATR: {data['atr']:.8f}\n"
+            
         message += f"\nTechnical Indicators:\n"
         message += f"• MA200: {'YES' if data['ma200_valid'] else 'NO'}\n"
         message += f"• MA50: {'YES' if data['ma50_valid'] else 'NO'}\n"

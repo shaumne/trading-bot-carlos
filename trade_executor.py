@@ -13,6 +13,9 @@ import threading
 from datetime import datetime
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
+import telegram
+import asyncio
+import aiohttp
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +30,70 @@ logger = logging.getLogger("sui_trader_sheets")
 
 # Load environment variables
 load_dotenv()
+
+class TelegramNotifier:
+    def __init__(self):
+        self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.bot = None
+        self.loop = None
+        
+        if self.bot_token and self.chat_id:
+            try:
+                self.bot = telegram.Bot(token=self.bot_token)
+                # Create a new event loop
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                logger.info(f"Telegram bot initialized successfully with chat_id: {self.chat_id}")
+                # Test message
+                self.send_message("🤖 Trading Bot Started - Telegram notifications are active")
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram bot: {str(e)}")
+        else:
+            logger.error("Telegram configuration missing! Please check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables")
+            if not self.bot_token:
+                logger.error("TELEGRAM_BOT_TOKEN is not set")
+            if not self.chat_id:
+                logger.error("TELEGRAM_CHAT_ID is not set")
+    
+    async def send_message_async(self, message):
+        if not self.bot or not self.chat_id:
+            logger.warning("Telegram bot not configured, skipping notification")
+            return
+            
+        try:
+            # Configure connection pool
+            connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                self.bot._session = session
+                await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='HTML')
+                logger.info(f"Telegram message sent successfully: {message}")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {str(e)}")
+            logger.error(f"Bot token: {self.bot_token[:5]}...")
+            logger.error(f"Chat ID: {self.chat_id}")
+    
+    def send_message(self, message):
+        if not self.bot or not self.chat_id:
+            logger.warning("Telegram bot not configured, skipping notification")
+            return
+            
+        try:
+            if self.loop and not self.loop.is_closed():
+                self.loop.run_until_complete(self.send_message_async(message))
+            else:
+                # Create new loop if current one is closed
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.loop.run_until_complete(self.send_message_async(message))
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {str(e)}")
+            logger.error(f"Bot token: {self.bot_token[:5]}...")
+            logger.error(f"Chat ID: {self.chat_id}")
+        finally:
+            # Don't close the loop, just clean up
+            if self.loop and self.loop.is_running():
+                self.loop.stop()
 
 class CryptoExchangeAPI:
     """Class to handle Crypto.com Exchange API requests using the approaches from sui_trading_script"""
@@ -718,12 +785,16 @@ class GoogleSheetTradeManager:
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
         self.credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
         self.worksheet_name = os.getenv("GOOGLE_WORKSHEET_NAME", "Trading")
+        self.archive_worksheet_name = os.getenv("ARCHIVE_WORKSHEET_NAME", "Archive")
         self.exchange_api = CryptoExchangeAPI()
+        self.telegram = TelegramNotifier()
         self.check_interval = int(os.getenv("TRADE_CHECK_INTERVAL", "5"))  # Default 5 seconds
         self.batch_size = int(os.getenv("BATCH_SIZE", "5"))  # Process in batches
         self.active_positions = {}  # Track active positions
         self.atr_period = int(os.getenv("ATR_PERIOD", "14"))  # Default ATR period
         self.atr_multiplier = float(os.getenv("ATR_MULTIPLIER", "2.0"))  # Default ATR multiplier
+        self.last_tp_sl_revision = 0  # Son revize zamanı (timestamp)
+        self.tp_sl_revision_interval = 10  # 10 dakika (saniye)
         
         # Connect to Google Sheets
         scope = [
@@ -737,12 +808,34 @@ class GoogleSheetTradeManager:
         
         self.client = gspread.authorize(credentials)
         self.sheet = self.client.open_by_key(self.sheet_id)
+        
+        # Get or create worksheets
         try:
             self.worksheet = self.sheet.worksheet(self.worksheet_name)
         except:
             self.worksheet = self.sheet.get_worksheet(0)
+            
+        try:
+            self.archive_worksheet = self.sheet.worksheet(self.archive_worksheet_name)
+        except:
+            # Create archive worksheet if it doesn't exist
+            self.archive_worksheet = self.sheet.add_worksheet(
+                title=self.archive_worksheet_name,
+                rows=1000,
+                cols=20
+            )
+            # Set archive headers
+            archive_headers = [
+                "TRADE", "Coin", "Last Price", "Buy Target", "Buy Recommendation",
+                "Sell Target", "Stop-Loss", "Order Placed?", "Order Place Date",
+                "Order PURCHASE Price", "Order PURCHASE Quantity", "Order PURCHASE Date",
+                "Order SOLD", "SOLD Price", "SOLD Quantity", "SOLD Date", "Notes",
+                "RSI", "Method", "Resistance Up", "Resistance Down", "Last Updated",
+                "RSI Sparkline", "RSI DATA"
+            ]
+            self.archive_worksheet.update('A1', [archive_headers])
         
-        logger.info(f"Connected to Google Sheet: {self.sheet.title}")
+        logger.info(f"Connected to Google Sheets: {self.sheet.title}")
         
         # Ensure order_id column exists
         self.ensure_order_id_column_exists()
@@ -1212,174 +1305,87 @@ class GoogleSheetTradeManager:
             logger.error(f"Error getting trade signals: {str(e)}")
             return [] 
 
+    def get_column_index_by_name(self, name):
+        headers = self.worksheet.row_values(1)
+        if name in headers:
+            return headers.index(name) + 1  # 1-indexed
+        else:
+            raise Exception(f"Column {name} not found in sheet!")
+
     def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None, stop_loss=None, take_profit=None):
-        """Update trade status in Google Sheet"""
+        """Update trade status in Google Sheet (column name based)"""
         try:
-            # Kolon indeksleri (1-indexed):
-            # 1: TRADE
-            # 2: Coin
-            # 3: Last Price
-            # 4: Buy Target
-            # 5: Buy Signal
-            # 6: Take Profit
-            # 7: Stop-Loss
-            # 8: Order Placed?
-            # 9: Order Date
-            # 10: Purchase Price
-            # 11: Quantity
-            # 12: Purchase Date
-            # 13: Sold?
-            # 14: Sell Price
-            # 15: Sell Quantity
-            # 16: Sold Date
-            # 17: Notes
-            # 33: order_id
-            # 34: Tradable (yeni eklenen kolon)
-            logger.info(f"Updating trade status for row {row_index}: {status} with correct column mapping")
-            
-            # Sayısal değerleri düzgün formatlama fonksiyonu
+            logger.info(f"Updating trade status for row {row_index}: {status} (column name based)")
+
             def format_number_for_sheet(value):
                 if value is None:
                     return ""
-                    
-                # Bilimsel gösterimi engellemek için
                 if isinstance(value, (int, float)):
-                    # Küçük sayılar için (0.001'den küçük) 8 basamak hassasiyet kullanılır
-                    if abs(value) < 0.001:
-                        return "{:.8f}".format(value).replace(".", ",")
-                    # Normal sayılar için en fazla 6 basamak hassasiyet
-                    else:
-                        return "{:.6f}".format(value).replace(".", ",")
-                return str(value).replace(".", ",")  # Türkçe format için nokta yerine virgül
-            
-            # Order Placed? (column 8)
-            self.worksheet.update_cell(row_index, 8, status)
-            
-            # When order is placed
+                    # Bilimsel gösterimi engelle, 8 ondalık basamakla yaz
+                    return "{:.8f}".format(value).rstrip("0").rstrip(".")
+                return str(value)
+
+            # Order Placed? (Order Placed?)
+            self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Placed?'), status)
+
             if status == "ORDER_PLACED":
-                # Set Tradable to NO (kolon 34)
-                tradable_col = 34
                 try:
-                    self.worksheet.update_cell(row_index, tradable_col, "NO")
-                    logger.info(f"Set Tradable to NO in column {tradable_col}")
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "NO")
                 except Exception as e:
                     logger.error(f"Error updating Tradable column: {str(e)}")
-                
-                # Update Order Date (column 9)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.worksheet.update_cell(row_index, 9, timestamp)
-                
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Date'), timestamp)
                 if purchase_price:
-                    # Update Purchase Price (column 10) - Özel format ile
                     formatted_price = format_number_for_sheet(purchase_price)
-                    self.worksheet.update_cell(row_index, 10, formatted_price)
-                    logger.info(f"Updated purchase price: {purchase_price} as {formatted_price}")
-                
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Price'), formatted_price)
                 if quantity:
-                    # Update Quantity (column 11) - Doğru formatla
                     formatted_quantity = format_number_for_sheet(quantity)
-                    self.worksheet.update_cell(row_index, 11, formatted_quantity)
-                    logger.info(f"Updated quantity: {quantity} as {formatted_quantity}")
-                
-                # Update Take Profit and Stop Loss columns
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Quantity'), formatted_quantity)
                 if take_profit:
-                    # Değeri kontrol et, çok büyükse (>100) düzelt
-                    if take_profit > 100 and isinstance(take_profit, (int, float)):
-                        logger.warning(f"Take Profit değeri çok büyük görünüyor: {take_profit}, düzeltiliyor")
-                        take_profit = take_profit / 10
-                        logger.info(f"Düzeltilmiş Take Profit: {take_profit}")
-                        
                     formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, 6, formatted_tp)
-                    logger.info(f"Updated Take Profit: {take_profit} as {formatted_tp}")
-                    
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), formatted_tp)
                 if stop_loss:
-                    # Değeri kontrol et, çok büyükse (>100) düzelt
-                    if stop_loss > 100 and isinstance(stop_loss, (int, float)):
-                        logger.warning(f"Stop Loss değeri çok büyük görünüyor: {stop_loss}, düzeltiliyor")
-                        stop_loss = stop_loss / 10
-                        logger.info(f"Düzeltilmiş Stop Loss: {stop_loss}")
-                        
                     formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, 7, formatted_sl)
-                    logger.info(f"Updated Stop Loss: {stop_loss} as {formatted_sl}")
-                    
-                # Update Purchase Date (column 12)
-                self.worksheet.update_cell(row_index, 12, timestamp)
-                
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), formatted_sl)
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Date'), timestamp)
                 if order_id:
-                    # Store the order ID in Notes (column 17)
-                    self.worksheet.update_cell(row_index, 17, f"Order ID: {order_id}")
-                    
-                    # Also store in the order_id column if it exists
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), f"Order ID: {order_id}")
                     headers = self.worksheet.row_values(1)
                     if 'order_id' in headers:
-                        order_id_col = headers.index('order_id') + 1
+                        order_id_col = self.get_column_index_by_name('order_id')
                         self.worksheet.update_cell(row_index, order_id_col, order_id)
-                        logger.info(f"Updated order_id in column {order_id_col} for row {row_index}: {order_id}")
-            
-            # When position is sold
             elif status == "SOLD":
-                logger.info(f"Updating sheet for SOLD status in row {row_index}")
-                
-                # Change Buy Signal to WAIT (column 5)
-                self.worksheet.update_cell(row_index, 5, "WAIT")
-                logger.info(f"Updated Buy Signal to WAIT for row {row_index}")
-                
-                # Update Sold? (column 13)
-                self.worksheet.update_cell(row_index, 13, "YES")
-                
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Buy Signal'), "WAIT")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold?'), "YES")
                 if sell_price:
-                    # Update Sell Price (column 14) - Özel format ile
                     formatted_sell_price = format_number_for_sheet(sell_price)
-                    self.worksheet.update_cell(row_index, 14, formatted_sell_price)
-                    logger.info(f"Updated sell price: {sell_price} as {formatted_sell_price}")
-                
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Price'), formatted_sell_price)
                 if quantity:
-                    # Update Sell Quantity (column 15) - Doğru formatla
                     formatted_sell_quantity = format_number_for_sheet(quantity)
-                    self.worksheet.update_cell(row_index, 15, formatted_sell_quantity)
-                    logger.info(f"Updated sell quantity: {quantity} as {formatted_sell_quantity}")
-                
-                # Update Sold Date (column 16)
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Quantity'), formatted_sell_quantity)
                 sold_date = sell_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.worksheet.update_cell(row_index, 16, sold_date)
-                
-                # Set Tradable back to YES (kolon 34)
-                tradable_col = 34
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold Date'), sold_date)
                 try:
-                    self.worksheet.update_cell(row_index, tradable_col, "YES")
-                    logger.info(f"Set Tradable back to YES in column {tradable_col}")
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "YES")
                 except Exception as e:
                     logger.error(f"Error updating Tradable column: {str(e)}")
-                
-                # Add note that position is closed
                 try:
-                    current_notes = self.worksheet.cell(row_index, 17).value or ""
+                    current_notes = self.worksheet.cell(row_index, self.get_column_index_by_name('Notes')).value or ""
                     new_notes = f"{current_notes} | Position closed: {sold_date}"
-                    self.worksheet.update_cell(row_index, 17, new_notes)
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), new_notes)
                 except Exception as e:
                     logger.error(f"Error updating Notes column: {str(e)}")
-                
-                # Clear the order_id after selling
                 headers = self.worksheet.row_values(1)
                 if 'order_id' in headers:
-                    order_id_col = headers.index('order_id') + 1
+                    order_id_col = self.get_column_index_by_name('order_id')
                     self.worksheet.update_cell(row_index, order_id_col, "")
-                    logger.info(f"Cleared order_id in column {order_id_col} for row {row_index}")
-            
-            # Just update Take Profit and Stop Loss without changing status
             elif status == "UPDATE_TP_SL":
                 if take_profit:
                     formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, 6, formatted_tp)
-                    logger.info(f"Updated Take Profit: {take_profit} as {formatted_tp}")
-                    
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), formatted_tp)
                 if stop_loss:
                     formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, 7, formatted_sl)
-                    logger.info(f"Updated Stop Loss: {stop_loss} as {formatted_sl}")
-            
+                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), formatted_sl)
             logger.info(f"Successfully updated trade status for row {row_index}: {status}")
             return True
         except Exception as e:
@@ -1645,9 +1651,28 @@ class GoogleSheetTradeManager:
                 
                 if status == "FILLED":
                     logger.info(f"Sell order {order_id} is filled")
+                    
+                    # Cancel the opposite order (TP or SL)
+                    self.cancel_opposite_order(symbol, order_id)
+                    
+                    # Send Telegram notification
+                    self.telegram.send_message(
+                        f"✅ SELL Order filled:\n"
+                        f"Symbol: {symbol}\n"
+                        f"Order ID: {order_id}"
+                    )
+                    
                     return True
                 elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
                     logger.warning(f"Sell order {order_id} is {status}")
+                    
+                    # Send Telegram notification
+                    self.telegram.send_message(
+                        f"⚠️ SELL Order {status}:\n"
+                        f"Symbol: {symbol}\n"
+                        f"Order ID: {order_id}"
+                    )
+                    
                     return False
                 
                 # Bekle ve tekrar kontrol et
@@ -1752,9 +1777,11 @@ class GoogleSheetTradeManager:
                     # Gerçek miktarı ve fiyatı kullan (monitor_position'da güncellendi)
                     actual_quantity = self.active_positions[symbol].get('quantity', estimated_quantity)
                     actual_price = self.active_positions[symbol].get('price', price)
-                    
+                    tp_order_id = None
+                    sl_order_id = None
+
                     logger.info(f"BUY order filled! Using actual quantity ({actual_quantity}) for TP/SL orders")
-                    
+
                     # Gerçek miktar kullanarak TP/SL emirlerini oluştur
                     tp_order_id, sl_order_id = self.place_tp_sl_orders(
                         symbol, 
@@ -1764,7 +1791,7 @@ class GoogleSheetTradeManager:
                         stop_loss, 
                         row_index
                     )
-                    
+
                     # Sipariş ID'lerini pozisyon bilgilerimize kaydet
                     if tp_order_id or sl_order_id:
                         self.active_positions[symbol]['tp_order_id'] = tp_order_id
@@ -1780,6 +1807,19 @@ class GoogleSheetTradeManager:
                             self.worksheet.update_cell(row_index, 17, new_notes)
                         except Exception as e:
                             logger.error(f"Error updating Notes with TP/SL orders: {str(e)}")
+                        
+                        # Detaylı Telegram mesajı gönder
+                        self.telegram.send_message(
+                            f"🟢 BUY Order Filled!\n"
+                            f"Symbol: {symbol}\n"
+                            f"Entry Price: {actual_price}\n"
+                            f"Quantity: {actual_quantity}\n"
+                            f"TP: {take_profit}\n"
+                            f"SL: {stop_loss}\n"
+                            f"TP Order ID: {tp_order_id or 'N/A'}\n"
+                            f"SL Order ID: {sl_order_id or 'N/A'}\n"
+                            f"Main Order ID: {order_id}"
+                        )
                 else:
                     logger.warning(f"BUY order was not filled, cannot place TP/SL orders")
                     # Eğer pozisyon hala aktivse ama filled değilse, pozisyonu kaldır
@@ -1941,6 +1981,20 @@ class GoogleSheetTradeManager:
                     del self.active_positions[symbol]
                 
                 logger.info(f"Completed sell for {symbol}, sheet updated")
+                
+                # Move to archive after successful sell
+                if self.move_to_archive(row_index):
+                    logger.info(f"Trade cycle completed for {symbol}, moved to archive")
+                
+                # Send Telegram notification for sell
+                self.telegram.send_message(
+                    f"🔴 SELL Order placed:\n"
+                    f"Symbol: {symbol}\n"
+                    f"Price: {price}\n"
+                    f"Quantity: {actual_quantity}\n"
+                    f"Order ID: {sell_order_id}"
+                )
+                
                 return True
                     
             except Exception as e:
@@ -2075,12 +2129,252 @@ class GoogleSheetTradeManager:
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
                 time.sleep(self.check_interval)
                 
+                # Her 10 dakikada bir TP/SL revize kontrolü
+                now = time.time()
+                if now - self.last_tp_sl_revision > self.tp_sl_revision_interval:
+                    logger.info("10 dakikalık TP/SL revize kontrolü başlatılıyor...")
+                    for symbol, position in list(self.active_positions.items()):
+                        if position['status'] == 'POSITION_ACTIVE':
+                            row_index = position['row_index']
+                            self.revise_tp_sl_orders(symbol, position, row_index)
+                    self.last_tp_sl_revision = now
+                
         except KeyboardInterrupt:
             logger.info("Trade Manager stopped by user")
         except Exception as e:
             logger.critical(f"Trade Manager crashed: {str(e)}")
             raise
 
+    def move_to_archive(self, row_index):
+        """Move completed trade to archive worksheet with correct column mapping, but keep the coin in the main sheet (set Tradable=YES, Buy Signal=WAIT)"""
+        try:
+            # Get the row data
+            row_data = self.worksheet.row_values(row_index)
+            
+            # Map columns from trading sheet to archive sheet
+            archive_data = [
+                row_data[0],  # TRADE
+                row_data[1],  # Coin
+                row_data[2],  # Last Price
+                row_data[3],  # Buy Target
+                row_data[4],  # Buy Signal -> Buy Recommendation
+                row_data[5],  # Take Profit -> Sell Target
+                row_data[6],  # Stop-Loss
+                row_data[7],  # Order Placed?
+                row_data[8],  # Order Date -> Order Place Date
+                row_data[9],  # Purchase Price -> Order PURCHASE Price
+                row_data[10], # Quantity -> Order PURCHASE Quantity
+                row_data[11], # Purchase Date -> Order PURCHASE Date
+                row_data[12], # Sold? -> Order SOLD
+                row_data[13], # Sell Price -> SOLD Price
+                row_data[14], # Sell Quantity -> SOLD Quantity
+                row_data[15], # Sold Date -> SOLD Date
+                row_data[16], # Notes
+                row_data[17], # RSI
+                "Trading Bot", # Method (new column)
+                row_data[19], # Resistance Up
+                row_data[20], # Resistance Down
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Last Updated
+                row_data[22], # RSI Sparkline
+                row_data[23]  # RSI DATA
+            ]
+            
+            # Append to archive worksheet
+            self.archive_worksheet.append_row(archive_data)
+            
+            # Main sheet'te coin satırını silmek yerine, Tradable=YES ve Buy Signal=WAIT olarak güncelle
+            try:
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "YES")
+            except Exception as e:
+                logger.error(f"Error updating Tradable column: {str(e)}")
+            try:
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Buy Signal'), "WAIT")
+            except Exception as e:
+                logger.error(f"Error updating Buy Signal column: {str(e)}")
+            try:
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Placed?'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold?'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Price'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Quantity'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold Date'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), "")
+                self.worksheet.update_cell(row_index, self.get_column_index_by_name('order_id'), "")
+            except Exception as e:
+                logger.error(f"Error clearing trade columns: {str(e)}")
+            
+            # Send Telegram notification
+            self.telegram.send_message(
+                f"🔄 Trade archived:\n"
+                f"Symbol: {row_data[1]}\n"
+                f"Entry: {row_data[9]}\n"
+                f"Exit: {row_data[13]}\n"
+                f"P/L: {float(row_data[13]) - float(row_data[9]) if row_data[13] and row_data[9] else 'N/A'}"
+            )
+            
+            logger.info(f"Trade moved to archive: {row_data[1]}")
+            return True
+        except Exception as e:
+            logger.error(f"Error moving trade to archive: {str(e)}")
+            return False
+
+    def cancel_opposite_order(self, symbol, order_id_to_keep):
+        """Cancel the opposite order (TP or SL) when one is executed"""
+        try:
+            if symbol in self.active_positions:
+                position = self.active_positions[symbol]
+                
+                # Get the order IDs
+                tp_order_id = position.get('tp_order_id')
+                sl_order_id = position.get('sl_order_id')
+                
+                # Determine which order to cancel
+                order_id_to_cancel = None
+                if order_id_to_keep == tp_order_id:
+                    order_id_to_cancel = sl_order_id
+                elif order_id_to_keep == sl_order_id:
+                    order_id_to_cancel = tp_order_id
+                
+                if order_id_to_cancel:
+                    # Cancel the opposite order
+                    cancel_params = {"order_id": order_id_to_cancel}
+                    response = self.exchange_api.send_request("private/cancel-order", cancel_params)
+                    
+                    if response and response.get("code") == 0:
+                        logger.info(f"Successfully cancelled opposite order {order_id_to_cancel} for {symbol}")
+                        
+                        # Send Telegram notification
+                        self.telegram.send_message(
+                            f"❌ Cancelled opposite order:\n"
+                            f"Symbol: {symbol}\n"
+                            f"Order ID: {order_id_to_cancel}"
+                        )
+                        return True
+                    else:
+                        logger.error(f"Failed to cancel opposite order: {response}")
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error cancelling opposite order: {str(e)}")
+            return False
+
+    def get_tradingview_analysis(self, symbol):
+        """
+        TradingView'dan direnç/destek ve önerilen TP/SL değerlerini alır.
+        Burada TradingViewDataProvider veya benzeri bir modül kullanılmalı.
+        """
+        try:
+            from strategy import TradingViewDataProvider
+            provider = TradingViewDataProvider()
+            analysis = provider.get_analysis(symbol)
+            if analysis:
+                return {
+                    'take_profit': analysis.get('take_profit'),
+                    'stop_loss': analysis.get('stop_loss'),
+                    'resistance': analysis.get('resistance'),
+                    'support': analysis.get('support')
+                }
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"TradingView analiz hatası: {str(e)}")
+            return None
+
+    def revise_tp_sl_orders(self, symbol, position, row_index):
+        """
+        Direnç/destek seviyelerine göre TP/SL revizesi yapar.
+        """
+        try:
+            analysis = self.get_tradingview_analysis(symbol)
+            if not analysis:
+                logger.warning(f"TradingView analizi alınamadı, TP/SL revizesi atlandı: {symbol}")
+                return False
+            new_tp = analysis['take_profit']
+            new_sl = analysis['stop_loss']
+            current_tp = position.get('take_profit')
+            current_sl = position.get('stop_loss')
+            # %1'den fazla değişim varsa revize et
+            tp_diff = abs(new_tp - current_tp) / max(abs(current_tp), 1e-8)
+            sl_diff = abs(new_sl - current_sl) / max(abs(current_sl), 1e-8)
+            if tp_diff > 0.01 or sl_diff > 0.01:  # %1 eşik
+                logger.info(f"TP/SL revizesi başlatılıyor: {symbol} (TP değişim: {tp_diff:.4%}, SL değişim: {sl_diff:.4%})")
+                # Önce borsadaki eski TP/SL emirlerini iptal et
+                tp_order_id = position.get('tp_order_id')
+                sl_order_id = position.get('sl_order_id')
+                if tp_order_id:
+                    try:
+                        self.exchange_api.send_request("private/cancel-order", {"order_id": tp_order_id})
+                        logger.info(f"Eski TP emri iptal edildi: {tp_order_id}")
+                    except Exception as e:
+                        logger.error(f"TP emri iptal hatası: {str(e)}")
+                if sl_order_id:
+                    try:
+                        self.exchange_api.send_request("private/cancel-order", {"order_id": sl_order_id})
+                        logger.info(f"Eski SL emri iptal edildi: {sl_order_id}")
+                    except Exception as e:
+                        logger.error(f"SL emri iptal hatası: {str(e)}")
+                # Yeni TP/SL emirlerini oluştur
+                quantity = position.get('quantity')
+                actual_price = position.get('price')
+                tp_order_id, sl_order_id = self.place_tp_sl_orders(
+                    symbol,
+                    quantity,
+                    actual_price,
+                    new_tp,
+                    new_sl,
+                    row_index
+                )
+                # Pozisyonu güncelle
+                position['take_profit'] = new_tp
+                position['stop_loss'] = new_sl
+                position['tp_order_id'] = tp_order_id
+                position['sl_order_id'] = sl_order_id
+                logger.info(f"Yeni TP/SL emirleri oluşturuldu: TP={tp_order_id}, SL={sl_order_id}")
+                # Sheet'te de güncelle
+                self.update_trade_status(
+                    row_index,
+                    "UPDATE_TP_SL",
+                    take_profit=new_tp,
+                    stop_loss=new_sl
+                )
+                # Telegram bildirimi
+                try:
+                    logger.info("Attempting to send Telegram notification for TP/SL update...")
+                    message = (
+                        f"♻️ TP/SL Updated\n"
+                        f"Symbol: {symbol}\n"
+                        f"New TP: {new_tp}\n"
+                        f"New SL: {new_sl}\n"
+                        f"TP Order ID: {tp_order_id or 'N/A'}\n"
+                        f"SL Order ID: {sl_order_id or 'N/A'}"
+                    )
+                    logger.info(f"Prepared Telegram message: {message}")
+                    self.telegram.send_message(message)
+                    logger.info("Telegram notification sent successfully")
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification: {str(e)}")
+                    logger.error(f"Bot token: {self.telegram.bot_token[:5]}...")
+                    logger.error(f"Chat ID: {self.telegram.chat_id}")
+                return True
+            else:
+                logger.info(f"TP/SL değişimi %1'den az, revize edilmedi: {symbol}")
+                return False
+        except Exception as e:
+            logger.error(f"TP/SL revize hatası: {str(e)}")
+            return False
+
+def format_quantity_for_coin(symbol, quantity):
+    # Burada coin bazında hassasiyet belirleyebilirsiniz
+    integer_coins = ["LDO", "SUI", "BONK", "SHIB", "DOGE", "PEPE"]  # Gerekirse güncelle
+    two_decimal_coins = ["BTC", "ETH", "SOL", "LTC", "XRP"]  # Gerekirse güncelle
+
+    base = symbol.split('_')[0]
+    if base in integer_coins:
+        return str(int(quantity))
+    elif base in two_decimal_coins:
+        return "{:.2f}".format(quantity)
+    else:
+        # Default: 2 ondalık
+        return "{:.2f}".format(quantity)
 
 if __name__ == "__main__":
     try:
