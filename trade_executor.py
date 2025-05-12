@@ -806,8 +806,16 @@ class GoogleSheetTradeManager:
             self.credentials_file, scope
         )
         
-        self.client = gspread.authorize(credentials)
-        self.sheet = self.client.open_by_key(self.sheet_id)
+        try:
+            self.client = gspread.authorize(credentials)
+            self.sheet = self.client.open_by_key(self.sheet_id)
+        except gspread.exceptions.APIError as e:
+            if e.response.status_code == 429:
+                logger.error("Google API quota exceeded. Waiting to retry...")
+                time.sleep(60)  # 1 dakika bekle
+                # Yeniden dene
+                self.client = gspread.authorize(credentials)
+                self.sheet = self.client.open_by_key(self.sheet_id)
         
         # Get or create worksheets
         try:
