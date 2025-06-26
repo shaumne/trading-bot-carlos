@@ -1,0 +1,36 @@
+# Trading Bot Configuration Example
+# Rename to config.yaml and update with your settings
+
+bot:
+  update_interval: 60                # Main update interval in seconds
+  price_update_interval: 300         # How often to update prices without signal change
+  batch_size: 5                      # Number of pairs to process in parallel
+  workers: 5                         # Thread pool worker count
+  retry_delay: 120                   # Delay before retrying failed symbols
+  problem_symbol_reset_hours: 6      # How often to reset problem symbols list
+  max_problem_symbols: 50            # Maximum symbols to track as problematic
+  force_sheet_refresh_interval: 1800 # Force sheet refresh interval in seconds
+
+tradingview:
+  interval: "1h"                     # Timeframe for analysis (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M)
+  indicators:                        # Technical indicators to use
+    - "RSI"
+    - "MA"
+    - "EMA"
+  timeout: 30                        # Request timeout in seconds
+  retry_count: 3                     # Number of retries for API requests
+  user_agent: "Mozilla/5.0"          # User agent for requests
+  format_discovery_timeout: 60       # Timeout for symbol format discovery
+  
+google_sheets:
+  credentials_file: "credentials.json" # Path to Google API credentials
+  spreadsheet_id: "YOUR_SHEET_ID"    # Google Sheet ID (from URL)
+  worksheet_name: "Trading Pairs"    # Worksheet name
+  cache_ttl: 30                      # Cache TTL in seconds
+  batch_size: 50                     # Batch size for sheet operations
+  
+telegram:
+  token: "YOUR_BOT_TOKEN"            # Telegram Bot Token
+  chat_id: "YOUR_CHAT_ID"            # Telegram Chat ID
+  daily_summary_time: "20:00"        # Time for daily summary (24h format)
+  notification_level: "INFO"         # Min level for notifications (DEBUG, INFO, WARNING, ERROR) 

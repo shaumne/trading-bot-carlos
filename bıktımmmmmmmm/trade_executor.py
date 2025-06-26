@@ -794,7 +794,7 @@ class GoogleSheetTradeManager:
         self.atr_period = int(os.getenv("ATR_PERIOD", "14"))  # Default ATR period
         self.atr_multiplier = float(os.getenv("ATR_MULTIPLIER", "2.0"))  # Default ATR multiplier
         self.last_tp_sl_revision = 0  # Son revize zamanı (timestamp)
-        self.tp_sl_revision_interval = 600  # 10 dakika (saniye)
+        self.tp_sl_revision_interval = 10  # 10 dakika (saniye)
         
         # Connect to Google Sheets
         scope = [
@@ -2133,28 +2133,19 @@ class GoogleSheetTradeManager:
                         except Exception as e:
                             logger.error(f"Error checking take profit/stop loss for {symbol}: {str(e)}")
                 
-                # Her 10 dakikada bir TP/SL order kontrolü ve revize kontrolü
-                now = time.time()
-                if now - self.last_tp_sl_revision > self.tp_sl_revision_interval:
-                    logger.info("10 dakikalık TP/SL kontrol ve revize kontrolü başlatılıyor...")
-                    
-                    # Aktif pozisyonları kontrol et
-                    for symbol, position in list(self.active_positions.items()):
-                        if position['status'] == 'POSITION_ACTIVE':
-                            # TP/SL order durumlarını kontrol et
-                            if self.check_tp_sl_orders(symbol, position):
-                                logger.info(f"TP/SL order executed for {symbol}, position closed")
-                                continue  # Bu pozisyon kapandı, diğerine geç
-                            
-                            # Eğer pozisyon hala aktifse, TP/SL revizesi yap
-                            row_index = position['row_index']
-                            self.revise_tp_sl_orders(symbol, position, row_index)
-                            
-                    self.last_tp_sl_revision = now
-                
                 # Sleep until next check
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
                 time.sleep(self.check_interval)
+                
+                # Her 10 dakikada bir TP/SL revize kontrolü
+                now = time.time()
+                if now - self.last_tp_sl_revision > self.tp_sl_revision_interval:
+                    logger.info("10 dakikalık TP/SL revize kontrolü başlatılıyor...")
+                    for symbol, position in list(self.active_positions.items()):
+                        if position['status'] == 'POSITION_ACTIVE':
+                            row_index = position['row_index']
+                            self.revise_tp_sl_orders(symbol, position, row_index)
+                    self.last_tp_sl_revision = now
                 
         except KeyboardInterrupt:
             logger.info("Trade Manager stopped by user")
@@ -2209,14 +2200,7 @@ class GoogleSheetTradeManager:
             except Exception as e:
                 logger.error(f"Error updating Buy Signal column: {str(e)}")
             try:
-                # Clear all trade-related columns
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), "")
                 self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Placed?'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Date'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Price'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Quantity'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Date'), "")
                 self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold?'), "")
                 self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Price'), "")
                 self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Quantity'), "")
@@ -2384,92 +2368,6 @@ class GoogleSheetTradeManager:
                 return False
         except Exception as e:
             logger.error(f"TP/SL revize hatası: {str(e)}")
-            return False
-
-    def check_tp_sl_orders(self, symbol, position):
-        """
-        TP/SL emirlerinin durumunu kontrol eder ve biri gerçekleşmişse diğerini iptal eder
-        
-        Parameters:
-            symbol (str): İşlem çifti (örn. BTC_USDT)
-            position (dict): Pozisyon bilgileri
-            
-        Returns:
-            bool: True if any order was filled and handled, False otherwise
-        """
-        try:
-            tp_order_id = position.get('tp_order_id')
-            sl_order_id = position.get('sl_order_id')
-            
-            if not tp_order_id and not sl_order_id:
-                return False
-                
-            # TP order durumunu kontrol et
-            if tp_order_id:
-                tp_status = self.exchange_api.get_order_status(tp_order_id)
-                logger.info(f"TP order {tp_order_id} status: {tp_status}")
-                
-                if tp_status == "FILLED":
-                    logger.info(f"TP order filled for {symbol}, cancelling SL order")
-                    
-                    # SL emrini iptal et
-                    if sl_order_id:
-                        try:
-                            cancel_params = {"order_id": sl_order_id}
-                            self.exchange_api.send_request("private/cancel-order", cancel_params)
-                            logger.info(f"Successfully cancelled SL order {sl_order_id}")
-                            
-                            # Telegram bildirimi gönder
-                            self.telegram.send_message(
-                                f"✅ Take Profit Executed!\n"
-                                f"Symbol: {symbol}\n"
-                                f"TP Order ID: {tp_order_id}\n"
-                                f"Cancelled SL Order ID: {sl_order_id}"
-                            )
-                        except Exception as e:
-                            logger.error(f"Error cancelling SL order: {str(e)}")
-                    
-                    # Pozisyonu kapat
-                    if symbol in self.active_positions:
-                        del self.active_positions[symbol]
-                    
-                    return True
-            
-            # SL order durumunu kontrol et
-            if sl_order_id:
-                sl_status = self.exchange_api.get_order_status(sl_order_id)
-                logger.info(f"SL order {sl_order_id} status: {sl_status}")
-                
-                if sl_status == "FILLED":
-                    logger.info(f"SL order filled for {symbol}, cancelling TP order")
-                    
-                    # TP emrini iptal et
-                    if tp_order_id:
-                        try:
-                            cancel_params = {"order_id": tp_order_id}
-                            self.exchange_api.send_request("private/cancel-order", cancel_params)
-                            logger.info(f"Successfully cancelled TP order {tp_order_id}")
-                            
-                            # Telegram bildirimi gönder
-                            self.telegram.send_message(
-                                f"⚠️ Stop Loss Executed!\n"
-                                f"Symbol: {symbol}\n"
-                                f"SL Order ID: {sl_order_id}\n"
-                                f"Cancelled TP Order ID: {tp_order_id}"
-                            )
-                        except Exception as e:
-                            logger.error(f"Error cancelling TP order: {str(e)}")
-                    
-                    # Pozisyonu kapat
-                    if symbol in self.active_positions:
-                        del self.active_positions[symbol]
-                    
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error checking TP/SL orders for {symbol}: {str(e)}")
             return False
 
 def format_quantity_for_coin(symbol, quantity):
