@@ -388,12 +388,12 @@ class TradingViewDataProvider:
         # Count how many MA conditions are valid
         valid_ma_count = sum([data["ma200_valid"], data["ma50_valid"], data["ema10_valid"]])
         
-        # Buy signal (DAHA GEVŞEKLEŞTİRİLMİŞ KOŞULLAR):
-        # 1) RSI < 45 ve en az 1 hareketli ortalama koşulu sağlanırsa AL
-        # 2) VEYA RSI < 30 ise direkt AL (aşırı satım durumu)
+        # Buy signal (DAHA KATI KOŞULLAR):
+        # 1) RSI < 40 ve en az 2 hareketli ortalama koşulu sağlanırsa AL
+        # 2) VEYA RSI < 30 ve en az 1 hareketli ortalama koşulu sağlanırsa AL
         data["buy_signal"] = (
-            (data["rsi"] < 45 and valid_ma_count >= 1) or  # Normal alış durumu - daha yüksek RSI ve daha az MA koşulu
-            (data["rsi"] < 30)  # Aşırı satış durumu - hiçbir MA koşulu olmadan alış
+            (data["rsi"] < 40 and valid_ma_count >= 2) or  # Normal alış durumu
+            (data["rsi"] < 30 and valid_ma_count >= 1)  # Aşırı satış durumu - en az 1 MA koşulu ile
         )
         
         # Sell signal: RSI > 70 and price breaks resistance
@@ -1033,6 +1033,61 @@ class GoogleSheetIntegration:
             return len(pairs)
         except:
             return "Unknown"
+            
+    def has_open_position(self, symbol):
+        """
+        Belirli bir sembol için açık pozisyon olup olmadığını kontrol et
+        Eğer bir sembol için daha önce BUY işlemi yapılmış ve ORDER_PLACED 
+        veya FILLED durumunda ise ve satılmamışsa, açık pozisyon vardır.
+        
+        Args:
+            symbol: Pozisyonu kontrol edilecek sembol
+            
+        Returns:
+            bool: Açık pozisyon varsa True, yoksa False
+        """
+        try:
+            # Tüm kayıtları al
+            all_records = self.worksheet.get_all_records()
+            
+            for row in all_records:
+                # Öncelikle sembolü kontrol et
+                row_symbol = row.get('Coin', '')
+                
+                # Formatları standartlaştır
+                if '_' not in row_symbol and '/' not in row_symbol and '-' not in row_symbol:
+                    row_symbol = f"{row_symbol}_USDT"
+                elif '/' in row_symbol:
+                    row_symbol = row_symbol.replace('/', '_')
+                elif '-' in row_symbol:
+                    row_symbol = row_symbol.replace('-', '_')
+                
+                # Sembol eşleşiyorsa ve açık pozisyon (BUY emri verilmiş) varsa
+                if row_symbol.upper() == symbol.upper():
+                    # Status sütununu kontrol et - bu satılmamış bir işlem mi?
+                    status = row.get('Status', '')
+                    trade_action = row.get('Buy Signal', '')
+                    
+                    # Eğer alım sinyali verildi, sipariş verildi veya işlem dolduruldu ve satılmadı ise
+                    if (trade_action == 'BUY' and 
+                        (status in ['ORDER_PLACED', 'FILLED', 'PARTIALLY_FILLED'] or status == '')):
+                        # Order ID varsa, muhtemelen açık bir pozisyon var
+                        if row.get('Order ID', ''):
+                            logger.info(f"Açık pozisyon bulundu: {symbol}, status: {status}")
+                            return True
+                        
+                        # Order ID yok, ama BUY işlemi görünüyor
+                        if trade_action == 'BUY':
+                            logger.info(f"Alım sinyali verilmiş: {symbol}, henüz order ID yok")
+                            return True
+            
+            # Açık pozisyon bulunamadı
+            return False
+            
+        except Exception as e:
+            logger.error(f"Açık pozisyon kontrolü sırasında hata: {str(e)}")
+            # Hata durumunda güvenli taraf olarak False dön (pozisyon yokmuş gibi davran)
+            return False
 
     def update_timestamp_only(self, row_index, data):
         """Sadece timestamp sütununu güncelle"""
@@ -1336,6 +1391,15 @@ class TradingBot:
             
             # Store in analyzed pairs for daily summary
             self.analyzed_pairs[symbol] = analysis
+            
+            # AÇIK POZİSYON KONTROLÜ: Eğer sembol için açık pozisyon varsa, BUY sinyali üretme
+            if analysis["action"] == "BUY":
+                has_open_position = self.sheets.has_open_position(symbol)
+                if has_open_position:
+                    logger.info(f"{symbol} için açık pozisyon bulundu, BUY sinyali engelleniyor")
+                    # BUY sinyalini WAIT olarak değiştir
+                    analysis["action"] = "WAIT"
+                    analysis["buy_signal"] = False
             
             # Determine whether to update the sheet based on conditions
             should_update = False

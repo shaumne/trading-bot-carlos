@@ -2058,9 +2058,6 @@ class GoogleSheetTradeManager:
         logger.info("Starting Trade Manager")
         logger.info(f"Will check for signals every {self.check_interval} seconds")
         
-        last_order_check_time = 0
-        order_check_interval = 30  # 30 saniyede bir emir kontrolü yap
-        
         try:
             while True:
                 # Get and process trade signals
@@ -2135,16 +2132,6 @@ class GoogleSheetTradeManager:
                                     self.execute_trade({'symbol': symbol, 'action': 'SELL', 'last_price': current_price, 'row_index': row_index, 'original_symbol': symbol.split('_')[0]})
                         except Exception as e:
                             logger.error(f"Error checking take profit/stop loss for {symbol}: {str(e)}")
-                
-                # Belirli aralıklarla aktif emirleri kontrol et - EXCHANGE ÜZERİNDE GERÇEKLEŞEN EMİRLERİ TESPİT İÇİN
-                current_time = time.time()
-                if current_time - last_order_check_time > order_check_interval:
-                    logger.info("Exchange üzerinde gerçekleşen emirleri kontrol ediliyor...")
-                    # İki yöntemi de kullan - daha güvenilir olması için
-                    self.check_completed_orders()  # Order history ile kontrol
-                    self.check_recent_trades()     # Trade history ile kontrol
-                    last_order_check_time = current_time
-                    logger.info("Emir kontrolü tamamlandı")
                 
                 # Her 10 dakikada bir TP/SL order kontrolü ve revize kontrolü
                 now = time.time()
@@ -2483,176 +2470,6 @@ class GoogleSheetTradeManager:
             
         except Exception as e:
             logger.error(f"Error checking TP/SL orders for {symbol}: {str(e)}")
-            return False
-
-    def check_completed_orders(self):
-        """
-        TP/SL emirlerinin tamamlanıp tamamlanmadığını 'private/get-order-history' API'sini 
-        kullanarak kontrol eder
-        """
-        try:
-            current_time = int(time.time() * 1000)  # Milisaniye cinsinden şu anki zaman
-            
-            # Aktif pozisyonları kontrol et
-            for symbol, position in list(self.active_positions.items()):
-                tp_order_id = position.get('tp_order_id')
-                sl_order_id = position.get('sl_order_id')
-                
-                if not tp_order_id and not sl_order_id:
-                    continue  # TP/SL emri yoksa atla
-                
-                # Son 1 saat içindeki emirleri sorgula
-                one_hour_ago = current_time - (60 * 60 * 1000)
-                
-                params = {
-                    "instrument_name": symbol,
-                    "start_time": one_hour_ago,
-                    "end_time": current_time,
-                    "limit": 50  # Son 50 emri getir
-                }
-                
-                response = self.exchange_api.send_request("private/get-order-history", params)
-                
-                if response and response.get("code") == 0:
-                    orders = response.get("result", {}).get("data", [])
-                    
-                    for order in orders:
-                        order_id = order.get("order_id")
-                        status = order.get("status")
-                        
-                        # Bu emir bizim TP veya SL emri mi ve tamamlandı mı?
-                        if order_id in [tp_order_id, sl_order_id] and status == "FILLED":
-                            logger.info(f"Tamamlanan emir tespit edildi: {order_id} ({status}) for {symbol}")
-                            
-                            # İşlem tipini belirle (TP veya SL)
-                            order_type = "TP" if order_id == tp_order_id else "SL"
-                            
-                            # Pozisyonu kapat ve diğer emirleri iptal et
-                            self.handle_position_closed(symbol, position, order_type)
-                            break
-        except Exception as e:
-            logger.error(f"check_completed_orders sırasında hata: {str(e)}")
-    
-    def check_recent_trades(self):
-        """
-        Son gerçekleşen işlemleri 'private/get-trades' API'sini kullanarak kontrol ederek 
-        TP/SL tetiklenmelerini tespit eder
-        """
-        try:
-            current_time = int(time.time() * 1000)  # Milisaniye cinsinden şu anki zaman
-            
-            # Aktif pozisyonları kontrol et
-            for symbol, position in list(self.active_positions.items()):
-                tp_order_id = position.get('tp_order_id')
-                sl_order_id = position.get('sl_order_id')
-                
-                if not tp_order_id and not sl_order_id:
-                    continue  # TP/SL emri yoksa atla
-                    
-                # Son 15 dakika içindeki işlemleri sorgula
-                fifteen_mins_ago = current_time - (15 * 60 * 1000)
-                
-                params = {
-                    "instrument_name": symbol,
-                    "start_time": fifteen_mins_ago,
-                    "end_time": current_time,
-                    "limit": 20  # Son 20 işlemi getir
-                }
-                
-                response = self.exchange_api.send_request("private/get-trades", params)
-                
-                if response and response.get("code") == 0:
-                    trades = response.get("result", {}).get("data", [])
-                    
-                    for trade in trades:
-                        order_id = trade.get("order_id")
-                        side = trade.get("side")
-                        
-                        # Bu işlem bizim TP veya SL emirlerinden birine ait mi?
-                        if order_id in [tp_order_id, sl_order_id] and side == "SELL":
-                            logger.info(f"Gerçekleşen işlem tespit edildi: order_id={order_id}, trade_id={trade.get('trade_id')} for {symbol}")
-                            
-                            # İşlem tipini belirle (TP veya SL)
-                            order_type = "TP" if order_id == tp_order_id else "SL"
-                            
-                            # Pozisyonu kapat ve diğer emirleri iptal et
-                            self.handle_position_closed(symbol, position, order_type)
-                            break
-        except Exception as e:
-            logger.error(f"check_recent_trades sırasında hata: {str(e)}")
-    
-    def handle_position_closed(self, symbol, position, order_type):
-        """
-        Pozisyonun kapandığı tespit edildiğinde yapılacak işlemler
-        
-        Args:
-            symbol (str): İşlem çifti (örn. BTC_USDT)
-            position (dict): Pozisyon bilgileri
-            order_type (str): Gerçekleşen emir tipi - "TP" veya "SL"
-        """
-        try:
-            row_index = position['row_index']
-            
-            # Hangi emrin gerçekleştiğini kaydet
-            executed_order_id = position.get('tp_order_id') if order_type == "TP" else position.get('sl_order_id')
-            cancel_order_id = position.get('sl_order_id') if order_type == "TP" else position.get('tp_order_id')
-            
-            logger.info(f"{symbol} için {order_type} emri gerçekleşti (order_id: {executed_order_id})")
-            
-            # Diğer açık emri iptal et
-            if cancel_order_id:
-                try:
-                    self.exchange_api.send_request("private/cancel-order", {"order_id": cancel_order_id})
-                    logger.info(f"Karşıt emir iptal edildi: {cancel_order_id}")
-                except Exception as e:
-                    logger.error(f"Emir iptal hatası: {str(e)}")
-            
-            # Gerçekleşen emrin detaylarını al
-            try:
-                order_detail = self.exchange_api.send_request("private/get-order-detail", {"order_id": executed_order_id})
-                
-                if order_detail and order_detail.get("code") == 0:
-                    result = order_detail.get("result", {})
-                    avg_price = float(result.get("avg_price", 0))
-                    cumulative_quantity = float(result.get("cumulative_quantity", 0))
-                    
-                    # Sheette trade'i güncelle
-                    self.update_trade_status(
-                        row_index, 
-                        "SOLD", 
-                        sell_price=avg_price, 
-                        quantity=cumulative_quantity,
-                        sell_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    )
-                    
-                    logger.info(f"Gerçekleşen emir detayları: fiyat={avg_price}, miktar={cumulative_quantity}")
-                else:
-                    logger.warning(f"Emir detayları alınamadı, varsayılan değerlerle güncelleniyor")
-                    # Detay alınamazsa varsayılan olarak normal güncelleme yap
-                    self.update_trade_status(row_index, "SOLD")
-            except Exception as e:
-                logger.error(f"Emir detayı alma hatası: {str(e)}")
-                # Hata olsa bile sheette işlemi güncelle
-                self.update_trade_status(row_index, "SOLD")
-            
-            # İşlemi arşive taşı
-            self.move_to_archive(row_index)
-            
-            # Aktif pozisyonlardan kaldır
-            if symbol in self.active_positions:
-                del self.active_positions[symbol]
-            
-            # Telegram bildirimi gönder
-            self.telegram.send_message(
-                f"{'🟢 Take Profit' if order_type == 'TP' else '🔴 Stop Loss'} Gerçekleşti:\n"
-                f"Symbol: {symbol}\n"
-                f"Order ID: {executed_order_id}\n"
-                f"Not: Bu işlem exchange üzerinde otomatik olarak gerçekleşmiştir ve sistem tarafından tespit edilmiştir."
-            )
-            
-            return True
-        except Exception as e:
-            logger.error(f"handle_position_closed sırasında hata: {str(e)}")
             return False
 
 def format_quantity_for_coin(symbol, quantity):
