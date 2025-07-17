@@ -16,10 +16,14 @@ from oauth2client.service_account import ServiceAccountCredentials
 import telegram
 import asyncio
 import aiohttp
+import pandas as pd
+import openpyxl
+from collections import defaultdict
+import uuid
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("sui_trader_sheets.log", encoding='utf-8'),
@@ -30,6 +34,248 @@ logger = logging.getLogger("sui_trader_sheets")
 
 # Load environment variables
 load_dotenv()
+
+class LocalSheetManager:
+    """Manages local Excel files for batch updates to Google Sheets"""
+    
+    def __init__(self, data_dir="local_data"):
+        self.data_dir = data_dir
+        self.pending_updates_file = os.path.join(data_dir, "pending_updates.xlsx")
+        self.archive_file = os.path.join(data_dir, "local_archive.xlsx")
+        self.main_sheet_file = os.path.join(data_dir, "main_sheet_cache.xlsx")
+        
+        # Create data directory if it doesn't exist
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # Initialize pending updates queue
+        self.pending_updates = []
+        self.pending_archive = []
+        self.pending_clears = []
+        
+        # Lock for thread safety
+        self.lock = threading.Lock()
+        
+        # Load existing pending updates
+        self._load_pending_updates()
+        
+        logger.info(f"LocalSheetManager initialized with data directory: {data_dir}")
+    
+    def _load_pending_updates(self):
+        """Load pending updates from local file"""
+        try:
+            if os.path.exists(self.pending_updates_file):
+                df = pd.read_excel(self.pending_updates_file)
+                for _, row in df.iterrows():
+                    update_data = {
+                        'id': row.get('id'),
+                        'type': row.get('type'),
+                        'row_index': row.get('row_index'),
+                        'column': row.get('column'),
+                        'value': row.get('value'),
+                        'timestamp': row.get('timestamp'),
+                        'retries': row.get('retries', 0)
+                    }
+                    self.pending_updates.append(update_data)
+                logger.info(f"Loaded {len(self.pending_updates)} pending updates")
+        except Exception as e:
+            logger.error(f"Error loading pending updates: {str(e)}")
+    
+    def _save_pending_updates(self):
+        """Save pending updates to local file"""
+        try:
+            if self.pending_updates:
+                df = pd.DataFrame(self.pending_updates)
+                df.to_excel(self.pending_updates_file, index=False)
+            elif os.path.exists(self.pending_updates_file):
+                # Remove file if no pending updates
+                os.remove(self.pending_updates_file)
+        except Exception as e:
+            logger.error(f"Error saving pending updates: {str(e)}")
+    
+    def add_cell_update(self, row_index, column, value, update_type="cell_update"):
+        """Add a cell update to pending queue"""
+        with self.lock:
+            # Check for duplicate cell update for the same row and column
+            for existing_update in self.pending_updates:
+                if (existing_update['row_index'] == row_index and 
+                    existing_update['column'] == column and
+                    existing_update['value'] == value):
+                    logger.debug(f"Identical cell update for row {row_index}, column {column} already exists, skipping duplicate")
+                    return
+            
+            # If there's a different value for the same row/column, remove the old one
+            self.pending_updates = [u for u in self.pending_updates 
+                                  if not (u['row_index'] == row_index and u['column'] == column)]
+            
+            update_id = str(uuid.uuid4())
+            update_data = {
+                'id': update_id,
+                'type': update_type,
+                'row_index': row_index,
+                'column': column,
+                'value': value,
+                'timestamp': datetime.now().isoformat(),
+                'retries': 0
+            }
+            self.pending_updates.append(update_data)
+            self._save_pending_updates()
+            logger.debug(f"Added cell update: row {row_index}, column {column}")
+    
+    def add_archive_operation(self, row_index, row_data, columns_to_clear=None):
+        """Add an archive operation to pending queue with optional clear operations"""
+        with self.lock:
+            # Check for duplicate archive operation for the same row
+            for existing_archive in self.pending_archive:
+                if existing_archive['row_index'] == row_index:
+                    logger.warning(f"Archive operation for row {row_index} already exists, skipping duplicate")
+                    return
+            
+            archive_id = str(uuid.uuid4())
+            archive_data = {
+                'id': archive_id,
+                'type': 'archive',
+                'row_index': row_index,
+                'row_data': row_data,
+                'columns_to_clear': columns_to_clear or [],
+                'timestamp': datetime.now().isoformat(),
+                'retries': 0
+            }
+            self.pending_archive.append(archive_data)
+            
+            # Also save to local archive immediately
+            self._save_to_local_archive(row_data)
+            logger.info(f"Added archive operation for row {row_index} with {len(columns_to_clear or [])} columns to clear after")
+    
+    def add_clear_operations(self, row_index, columns):
+        """Add multiple clear operations for a row"""
+        with self.lock:
+            clear_id = str(uuid.uuid4())
+            clear_data = {
+                'id': clear_id,
+                'type': 'clear_row',
+                'row_index': row_index,
+                'columns': columns,
+                'timestamp': datetime.now().isoformat(),
+                'retries': 0
+            }
+            self.pending_clears.append(clear_data)
+            logger.debug(f"Added clear operations for row {row_index}, {len(columns)} columns")
+    
+    def _save_to_local_archive(self, row_data):
+        """Save archive data to local Excel file immediately"""
+        try:
+            # Prepare archive data matching the exact column names
+            archive_record = {
+                'TRADE': row_data.get('TRADE', ''),
+                'Coin': row_data.get('Coin', ''),
+                'Last Price': row_data.get('Last Price', ''),
+                'Buy Target': row_data.get('Buy Target', ''),
+                'Buy Recommendation': row_data.get('Buy Signal', ''),
+                'Sell Target': row_data.get('Take Profit', ''),
+                'Stop-Loss': row_data.get('Stop-Loss', ''),
+                'Order Placed?': row_data.get('Order Placed?', ''),
+                'Order Place Date': row_data.get('Order Date', ''),
+                'Order PURCHASE Price': row_data.get('Purchase Price', ''),
+                'Order PURCHASE Quantity': row_data.get('Quantity', ''),
+                'Order PURCHASE Date': row_data.get('Purchase Date', ''),
+                'Order SOLD': row_data.get('Sold?', ''),
+                'SOLD Price': row_data.get('Sell Price', ''),
+                'SOLD Quantity': row_data.get('Sell Quantity', ''),
+                'SOLD Date': row_data.get('Sold Date', ''),
+                'Notes': row_data.get('Notes', ''),
+                'RSI': row_data.get('RSI', ''),
+                'Method': 'Trading Bot',
+                'Resistance Up': row_data.get('Resistance Up', ''),
+                'Resistance Down': row_data.get('Resistance Down', ''),
+                'Last Updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'RSI Sparkline': row_data.get('RSI Sparkline', ''),
+                'RSI DATA': row_data.get('RSI DATA', '')
+            }
+            
+            # Load existing archive or create new
+            if os.path.exists(self.archive_file):
+                df = pd.read_excel(self.archive_file)
+                df = pd.concat([df, pd.DataFrame([archive_record])], ignore_index=True)
+            else:
+                df = pd.DataFrame([archive_record])
+            
+            # Save to file
+            df.to_excel(self.archive_file, index=False)
+            logger.info(f"Saved archive record to local file: {row_data.get('Coin', 'Unknown')}")
+            
+        except Exception as e:
+            logger.error(f"Error saving to local archive: {str(e)}")
+    
+    def get_pending_count(self):
+        """Get count of pending operations"""
+        with self.lock:
+            counts = {
+                'updates': len(self.pending_updates),
+                'archives': len(self.pending_archive),
+                'clears': len(self.pending_clears)
+            }
+            logger.debug(f"Pending operations count: {counts}")
+            return counts
+    
+    def get_batch_for_processing(self, max_batch_size=20):
+        """Get a batch of operations for processing"""
+        with self.lock:
+            batch = {
+                'updates': self.pending_updates[:max_batch_size],
+                'archives': self.pending_archive[:max_batch_size],
+                'clears': self.pending_clears[:max_batch_size]
+            }
+            
+            logger.debug(f"Batch prepared: {len(batch['updates'])} updates, {len(batch['archives'])} archives, {len(batch['clears'])} clears")
+            
+            # Log archive operations in detail
+            if batch['archives']:
+                for archive in batch['archives']:
+                    logger.info(f"Archive operation: row {archive['row_index']}, coin {archive['row_data'].get('Coin', 'Unknown')}")
+                    
+            return batch
+    
+    def mark_batch_completed(self, completed_ids):
+        """Mark batch operations as completed and remove from pending"""
+        with self.lock:
+            # Remove completed updates
+            self.pending_updates = [u for u in self.pending_updates if u['id'] not in completed_ids]
+            self.pending_archive = [a for a in self.pending_archive if a['id'] not in completed_ids]
+            self.pending_clears = [c for c in self.pending_clears if c['id'] not in completed_ids]
+            
+            self._save_pending_updates()
+            logger.info(f"Marked {len(completed_ids)} operations as completed")
+    
+    def mark_batch_failed(self, failed_ids, max_retries=3):
+        """Mark batch operations as failed and increment retry count"""
+        with self.lock:
+            current_time = datetime.now().isoformat()
+            
+            # Update retry counts for failed operations
+            for update in self.pending_updates:
+                if update['id'] in failed_ids:
+                    update['retries'] += 1
+                    update['last_retry'] = current_time
+                    if update['retries'] >= max_retries:
+                        logger.error(f"Update {update['id']} exceeded max retries, removing")
+                        
+            for archive in self.pending_archive:
+                if archive['id'] in failed_ids:
+                    archive['retries'] += 1
+                    archive['last_retry'] = current_time
+                    
+            for clear in self.pending_clears:
+                if clear['id'] in failed_ids:
+                    clear['retries'] += 1
+                    clear['last_retry'] = current_time
+            
+            # Remove operations that exceeded max retries
+            self.pending_updates = [u for u in self.pending_updates if u['retries'] < max_retries]
+            self.pending_archive = [a for a in self.pending_archive if a['retries'] < max_retries]
+            self.pending_clears = [c for c in self.pending_clears if c['retries'] < max_retries]
+            
+            self._save_pending_updates()
+            logger.warning(f"Marked {len(failed_ids)} operations as failed for retry")
 
 class TelegramNotifier:
     def __init__(self):
@@ -77,6 +323,11 @@ class TelegramNotifier:
         if not self.bot or not self.chat_id:
             logger.warning("Telegram bot not configured, skipping notification")
             return
+        
+        # Filter out rate limit and API error messages to avoid spam
+        if any(keyword in message.lower() for keyword in ['rate limit', 'quota exceeded', 'api error', '429', 'too many requests']):
+            logger.info("Skipping Telegram notification for rate limit/API error message")
+            return
             
         try:
             if self.loop and not self.loop.is_closed():
@@ -88,8 +339,7 @@ class TelegramNotifier:
                 self.loop.run_until_complete(self.send_message_async(message))
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {str(e)}")
-            logger.error(f"Bot token: {self.bot_token[:5]}...")
-            logger.error(f"Chat ID: {self.chat_id}")
+            # Don't log sensitive information in production
         finally:
             # Don't close the loop, just clean up
             if self.loop and self.loop.is_running():
@@ -560,48 +810,48 @@ class CryptoExchangeAPI:
                     
                     logger.error("All format retry attempts failed.")
                     
-                    # APPROACH 2: Parçalı satış yöntemi (sadece 213 hatası için)
-                    logger.info(f"213 hatası alındı. Parçalı satış yöntemine geçiliyor...")
-                    logger.info(f"Satış 100000 birim limitli parçalar halinde yapılacak")
+                    # APPROACH 2: Batch selling method (only for 213 error)
+                    logger.info(f"Error 213 received. Switching to batch selling method...")
+                    logger.info(f"Sale will be performed in batches of 100000 units")
                     
-                    # Toplam miktarı float olarak al
+                    # Get total quantity as float
                     total_quantity = float(quantity)
                     
-                    # Parça başına maksimum miktar (100000 birim)
+                    # Maximum batch size (100000 units)
                     max_batch_size = 100000
                     
-                    # Satılacak parça sayısını hesapla
+                    # Calculate number of batches needed
                     if base_currency in ["BONK", "SHIB", "DOGE", "PEPE"] and total_quantity > max_batch_size:
-                        # Kaç parça gerekiyor?
+                        # How many batches needed?
                         num_batches = int(total_quantity / max_batch_size) + (1 if total_quantity % max_batch_size > 0 else 0)
-                        logger.info(f"Toplam {total_quantity} {base_currency} için {num_batches} parça satış yapılacak")
+                        logger.info(f"Total {total_quantity} {base_currency} will be sold in {num_batches} batches")
                         
                         successful_orders = []
                         remaining_quantity = total_quantity
                         
                         for i in range(num_batches):
-                            # Son parça için kalan bakiyeyi kontrol et
+                            # For the last batch, check remaining balance
                             if i == num_batches - 1:
-                                # Son parça için güncel bakiyeyi al
+                                # Get current balance for last batch
                                 current_balance = self.get_coin_balance(base_currency)
                                 if not current_balance or float(current_balance) <= 0:
-                                    logger.info(f"Kalan bakiye bitti, satış tamamlandı")
+                                    logger.info(f"Remaining balance exhausted, sale completed")
                                     break
                                 
-                                # Kalan bakiyenin %98'ini kullan
+                                # Use 98% of remaining balance
                                 batch_quantity = float(current_balance) * 0.98
                             else:
-                                # Her parçada maksimum 100000 birim sat
+                                # Sell maximum 100000 units in each batch
                                 batch_quantity = min(max_batch_size, remaining_quantity)
                             
-                            # Meme coinler için tam sayı kullan
+                            # Use integer for meme coins
                             formatted_batch = int(batch_quantity)
                             
                             if formatted_batch <= 0:
-                                logger.warning(f"Parça {i+1} için miktar sıfır veya negatif, atlanıyor")
+                                logger.warning(f"Batch {i+1} quantity is zero or negative, skipping")
                                 continue
                                 
-                            logger.info(f"Parça {i+1}/{num_batches}: {formatted_batch} {base_currency} satılıyor")
+                            logger.info(f"Batch {i+1}/{num_batches}: Selling {formatted_batch} {base_currency}")
                             
                             batch_response = self.send_request(
                                 "private/create-order", 
@@ -616,21 +866,21 @@ class CryptoExchangeAPI:
                             if batch_response and batch_response.get("code") == 0:
                                 batch_order_id = batch_response["result"]["order_id"]
                                 successful_orders.append(batch_order_id)
-                                logger.info(f"Parça {i+1} başarıyla satıldı! Order ID: {batch_order_id}")
+                                logger.info(f"Batch {i+1} sold successfully! Order ID: {batch_order_id}")
                                 
-                                # Kalan miktarı güncelle
+                                # Update remaining quantity
                                 remaining_quantity -= batch_quantity
                                 
-                                # Her parça arasında kısa bir bekleme
+                                # Short wait between batches
                                 time.sleep(2)
                             else:
                                 batch_error = batch_response.get("message", "Unknown error") if batch_response else "No response"
-                                logger.error(f"Parça {i+1} satışı başarısız: {batch_error}")
+                                logger.error(f"Batch {i+1} sale failed: {batch_error}")
                                 
-                                # Farklı bir format ile tekrar dene
+                                # Try different format
                                 if "Invalid quantity format" in batch_error:
                                     modified_batch = int(float(formatted_batch) * 0.99)
-                                    logger.info(f"Parça {i+1} farklı format ile tekrar deneniyor: {modified_batch}")
+                                    logger.info(f"Batch {i+1} retrying with different format: {modified_batch}")
                                     
                                     retry_batch_response = self.send_request(
                                         "private/create-order", 
@@ -645,36 +895,36 @@ class CryptoExchangeAPI:
                                     if retry_batch_response and retry_batch_response.get("code") == 0:
                                         retry_batch_order_id = retry_batch_response["result"]["order_id"]
                                         successful_orders.append(retry_batch_order_id)
-                                        logger.info(f"Parça {i+1} tekrar denemesi başarılı! Order ID: {retry_batch_order_id}")
+                                        logger.info(f"Batch {i+1} retry successful! Order ID: {retry_batch_order_id}")
                                         
-                                        # Kalan miktarı güncelle
+                                        # Update remaining quantity
                                         remaining_quantity -= modified_batch
                                         
-                                        # Her parça arasında kısa bir bekleme
+                                        # Short wait between batches
                                         time.sleep(2)
                                     else:
                                         retry_batch_error = retry_batch_response.get("message", "Unknown error") if retry_batch_response else "No response"
-                                        logger.error(f"Parça {i+1} tekrar denemesi de başarısız: {retry_batch_error}")
+                                        logger.error(f"Batch {i+1} retry also failed: {retry_batch_error}")
                         
                         if successful_orders:
-                            logger.info(f"Toplam {len(successful_orders)}/{num_batches} parça başarıyla satıldı")
-                            return successful_orders[0]  # İlk başarılı emrin ID'sini döndür
+                            logger.info(f"Total {len(successful_orders)}/{num_batches} batches sold successfully")
+                            return successful_orders[0]  # Return first successful order ID
                         else:
-                            logger.error("Tüm parçalı satış denemeleri başarısız")
+                            logger.error("All batch selling attempts failed")
                     
-                    # APPROACH 3: Son çare - toplam miktarın %50'si ile dene
+                    # APPROACH 3: Last resort - try with 50% of total quantity
                     half_quantity = total_quantity * 0.5
                     
-                    # Para birimine göre format
+                    # Format based on currency
                     if base_currency in ["SUI", "BONK", "SHIB", "DOGE", "PEPE"]:
                         formatted_half = int(half_quantity)
                     else:
-                        # Temiz bir format kullan
+                        # Use clean format
                         formatted_half = "{:.8f}".format(half_quantity).rstrip('0').rstrip('.')
-                        if '.' not in formatted_half:  # Tam sayı olmuşsa öyle kalsın
+                        if '.' not in formatted_half:  # Keep as integer if no decimal
                             formatted_half = int(half_quantity)
                         
-                    logger.info(f"Son deneme: Miktarın %50'si ile deneniyor: {formatted_half}")
+                    logger.info(f"Last attempt: Trying with 50% of quantity: {formatted_half}")
                     
                     final_response = self.send_request(
                         "private/create-order", 
@@ -688,7 +938,7 @@ class CryptoExchangeAPI:
                     
                     if final_response and final_response.get("code") == 0:
                         final_order_id = final_response["result"]["order_id"]
-                        logger.info(f"Son %50 deneme başarılı! Order ID: {final_order_id}")
+                        logger.info(f"Last 50% attempt successful! Order ID: {final_order_id}")
                         return final_order_id
                 
                 return None
@@ -793,8 +1043,14 @@ class GoogleSheetTradeManager:
         self.active_positions = {}  # Track active positions
         self.atr_period = int(os.getenv("ATR_PERIOD", "14"))  # Default ATR period
         self.atr_multiplier = float(os.getenv("ATR_MULTIPLIER", "2.0"))  # Default ATR multiplier
-        self.last_tp_sl_revision = 0  # Son revize zamanı (timestamp)
-        self.tp_sl_revision_interval = 600  # 10 dakika (saniye)
+        self.last_tp_sl_revision = 0  # Last revision time (timestamp)
+        self.tp_sl_revision_interval = 600  # 10 minutes (seconds)
+        
+        # Initialize local sheet manager for batch operations
+        self.local_manager = LocalSheetManager()
+        self.batch_update_interval = int(os.getenv("BATCH_UPDATE_INTERVAL", "60"))  # Default 60 seconds
+        self.last_batch_update = 0
+        self.rate_limit_wait_time = 60  # Wait time when rate limited
         
         # Connect to Google Sheets
         scope = [
@@ -809,13 +1065,17 @@ class GoogleSheetTradeManager:
         try:
             self.client = gspread.authorize(credentials)
             self.sheet = self.client.open_by_key(self.sheet_id)
+            logger.info("Google Sheets connection established successfully")
         except gspread.exceptions.APIError as e:
             if e.response.status_code == 429:
                 logger.error("Google API quota exceeded. Waiting to retry...")
-                time.sleep(60)  # 1 dakika bekle
-                # Yeniden dene
+                time.sleep(self.rate_limit_wait_time)
+                # Retry
                 self.client = gspread.authorize(credentials)
                 self.sheet = self.client.open_by_key(self.sheet_id)
+        except Exception as e:
+            logger.error(f"Failed to connect to Google Sheets: {str(e)}")
+            logger.info("Will use local-only mode until connection is restored")
         
         # Get or create worksheets
         try:
@@ -823,33 +1083,77 @@ class GoogleSheetTradeManager:
         except:
             self.worksheet = self.sheet.get_worksheet(0)
             
+        # Initialize archive worksheet with more robust error handling
+        self.archive_worksheet = None
         try:
+            # First try to get by name
             self.archive_worksheet = self.sheet.worksheet(self.archive_worksheet_name)
-        except:
+            logger.info(f"Found archive worksheet by name: {self.archive_worksheet_name}")
+            
+            # Verify headers exist
+            headers = self.archive_worksheet.row_values(1)
+            if not headers or len(headers) < 10:  # Should have at least 10 columns
+                logger.warning("Archive worksheet found but headers are missing or incomplete")
+                self._setup_archive_headers()
+            else:
+                logger.info(f"Archive worksheet headers verified: {len(headers)} columns")
+                
+        except gspread.exceptions.WorksheetNotFound:
+            try:
+                # Try to get by index 1 (second worksheet)
+                self.archive_worksheet = self.sheet.get_worksheet(1)
+                if self.archive_worksheet:
+                    logger.info(f"Found archive worksheet by index 1: {self.archive_worksheet.title}")
+                    
+                    # Verify headers exist
+                    headers = self.archive_worksheet.row_values(1)
+                    if not headers or len(headers) < 10:
+                        logger.warning("Archive worksheet found but headers are missing or incomplete")
+                        self._setup_archive_headers()
+                    else:
+                        logger.info(f"Archive worksheet headers verified: {len(headers)} columns")
+                else:
+                    raise Exception("No worksheet at index 1")
+            except Exception:
             # Create archive worksheet if it doesn't exist
+                logger.info(f"Creating new archive worksheet: {self.archive_worksheet_name}")
             self.archive_worksheet = self.sheet.add_worksheet(
                 title=self.archive_worksheet_name,
                 rows=1000,
-                cols=20
+                    cols=25
             )
-            # Set archive headers
-            archive_headers = [
-                "TRADE", "Coin", "Last Price", "Buy Target", "Buy Recommendation",
-                "Sell Target", "Stop-Loss", "Order Placed?", "Order Place Date",
-                "Order PURCHASE Price", "Order PURCHASE Quantity", "Order PURCHASE Date",
-                "Order SOLD", "SOLD Price", "SOLD Quantity", "SOLD Date", "Notes",
-                "RSI", "Method", "Resistance Up", "Resistance Down", "Last Updated",
-                "RSI Sparkline", "RSI DATA"
-            ]
-            self.archive_worksheet.update('A1', [archive_headers])
+                self._setup_archive_headers()
+        except Exception as e:
+            logger.error(f"Error initializing archive worksheet: {str(e)}")
+            # Try to create it
+            try:
+                logger.info("Attempting to create new archive worksheet due to error")
+                self.archive_worksheet = self.sheet.add_worksheet(
+                    title=self.archive_worksheet_name,
+                    rows=1000,
+                    cols=25
+                )
+                self._setup_archive_headers()
+            except Exception as e2:
+                logger.error(f"Failed to create archive worksheet: {str(e2)}")
+                self.archive_worksheet = None
         
         logger.info(f"Connected to Google Sheets: {self.sheet.title}")
+        
+        # Log available worksheets
+        all_worksheets = self.sheet.worksheets()
+        logger.info(f"Available worksheets: {[ws.title for ws in all_worksheets]}")
+        logger.info(f"Main worksheet: {self.worksheet.title}")
+        logger.info(f"Archive worksheet: {self.archive_worksheet.title}")
         
         # Ensure order_id column exists
         self.ensure_order_id_column_exists()
         
         # ATR verilerini saklamak için cache oluştur
         self.atr_cache = {}  # {symbol: {'atr': value, 'timestamp': last_update_time}}
+        
+        # Column name to index mapping for batch operations
+        self.column_mapping = {}
     
     def ensure_order_id_column_exists(self):
         """Ensure that the order_id column exists in the worksheet"""
@@ -869,6 +1173,43 @@ class GoogleSheetTradeManager:
                 logger.info("'order_id' column already exists in worksheet")
         except Exception as e:
             logger.error(f"Error ensuring order_id column exists: {str(e)}")
+    
+    def _setup_archive_headers(self):
+        """Setup archive worksheet headers"""
+        try:
+            if not self.archive_worksheet:
+                logger.error("Archive worksheet not available for header setup")
+                return False
+                
+            # Set archive headers
+            archive_headers = [
+                "TRADE", "Coin", "Last Price", "Buy Target", "Buy Recommendation",
+                "Sell Target", "Stop-Loss", "Order Placed?", "Order Place Date",
+                "Order PURCHASE Price", "Order PURCHASE Quantity", "Order PURCHASE Date",
+                "Order SOLD", "SOLD Price", "SOLD Quantity", "SOLD Date", "Notes",
+                "RSI", "Method", "Resistance Up", "Resistance Down", "Last Updated",
+                "RSI Sparkline", "RSI DATA"
+            ]
+            
+            # Clear first row and set headers
+            self.archive_worksheet.clear()
+            self.archive_worksheet.update('A1', [archive_headers])
+            
+            logger.info(f"Archive worksheet headers set: {len(archive_headers)} columns")
+            
+            # Verify headers were set
+            time.sleep(1)  # Small delay to ensure write is complete
+            headers = self.archive_worksheet.row_values(1)
+            if headers and len(headers) >= len(archive_headers):
+                logger.info("✓ Archive worksheet headers verified successfully")
+                return True
+            else:
+                logger.warning(f"✗ Archive worksheet headers verification failed. Expected {len(archive_headers)}, got {len(headers) if headers else 0}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error setting up archive headers: {str(e)}")
+            return False
     
     def calculate_atr(self, symbol, period=14):
         """
@@ -1075,10 +1416,14 @@ class GoogleSheetTradeManager:
         Türkçe formatı (virgül) ve diğer formatları düzgün işler
         """
         try:
-            if not value_str or value_str.strip() == '':
+            # Eğer zaten sayısal bir değer ise, doğrudan dönüştür
+            if isinstance(value_str, (int, float)):
+                return float(value_str)
+                
+            if not value_str or str(value_str).strip() == '':
                 return 0.0
                 
-            # Temizle ve normalize et
+            # String'e dönüştür ve temizle
             value_str = str(value_str).strip().replace(' ', '')
             
             # Türkçe formatı: virgül ondalık ayırıcı, nokta binlik ayırıcı olabilir
@@ -1321,81 +1666,80 @@ class GoogleSheetTradeManager:
             raise Exception(f"Column {name} not found in sheet!")
 
     def update_trade_status(self, row_index, status, order_id=None, purchase_price=None, quantity=None, sell_price=None, sell_date=None, stop_loss=None, take_profit=None):
-        """Update trade status in Google Sheet (column name based)"""
+        """Update trade status - now uses local manager for batch processing"""
         try:
-            logger.info(f"Updating trade status for row {row_index}: {status} (column name based)")
+            logger.info(f"Updating trade status for row {row_index}: {status} (using batch system)")
 
             def format_number_for_sheet(value):
                 if value is None:
                     return ""
                 if isinstance(value, (int, float)):
-                    # Bilimsel gösterimi engelle, 8 ondalık basamakla yaz
                     return "{:.8f}".format(value).rstrip("0").rstrip(".")
                 return str(value)
 
-            # Order Placed? (Order Placed?)
-            self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Placed?'), status)
+            # Add updates to local manager instead of direct sheet updates
+            self.local_manager.add_cell_update(row_index, 'Order Placed?', status)
 
             if status == "ORDER_PLACED":
-                try:
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "NO")
-                except Exception as e:
-                    logger.error(f"Error updating Tradable column: {str(e)}")
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Date'), timestamp)
+                
+                # Add all updates to batch queue
+                self.local_manager.add_cell_update(row_index, 'Tradable', "NO")
+                self.local_manager.add_cell_update(row_index, 'Order Date', timestamp)
+                
                 if purchase_price:
                     formatted_price = format_number_for_sheet(purchase_price)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Price'), formatted_price)
+                    self.local_manager.add_cell_update(row_index, 'Purchase Price', formatted_price)
+                    
                 if quantity:
                     formatted_quantity = format_number_for_sheet(quantity)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Quantity'), formatted_quantity)
+                    self.local_manager.add_cell_update(row_index, 'Quantity', formatted_quantity)
+                    
                 if take_profit:
                     formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), formatted_tp)
+                    self.local_manager.add_cell_update(row_index, 'Take Profit', formatted_tp)
+                    
                 if stop_loss:
                     formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), formatted_sl)
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Date'), timestamp)
+                    self.local_manager.add_cell_update(row_index, 'Stop-Loss', formatted_sl)
+                    
+                self.local_manager.add_cell_update(row_index, 'Purchase Date', timestamp)
+                
                 if order_id:
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), f"Order ID: {order_id}")
-                    headers = self.worksheet.row_values(1)
-                    if 'order_id' in headers:
-                        order_id_col = self.get_column_index_by_name('order_id')
-                        self.worksheet.update_cell(row_index, order_id_col, order_id)
+                    self.local_manager.add_cell_update(row_index, 'Notes', f"Order ID: {order_id}")
+                    self.local_manager.add_cell_update(row_index, 'order_id', order_id)
+                    
             elif status == "SOLD":
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Buy Signal'), "WAIT")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold?'), "YES")
+                self.local_manager.add_cell_update(row_index, 'Buy Signal', "WAIT")
+                self.local_manager.add_cell_update(row_index, 'Sold?', "YES")
+                
                 if sell_price:
                     formatted_sell_price = format_number_for_sheet(sell_price)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Price'), formatted_sell_price)
+                    self.local_manager.add_cell_update(row_index, 'Sell Price', formatted_sell_price)
+                    
                 if quantity:
                     formatted_sell_quantity = format_number_for_sheet(quantity)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Quantity'), formatted_sell_quantity)
+                    self.local_manager.add_cell_update(row_index, 'Sell Quantity', formatted_sell_quantity)
+                    
                 sold_date = sell_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold Date'), sold_date)
-                try:
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "YES")
-                except Exception as e:
-                    logger.error(f"Error updating Tradable column: {str(e)}")
-                try:
-                    current_notes = self.worksheet.cell(row_index, self.get_column_index_by_name('Notes')).value or ""
-                    new_notes = f"{current_notes} | Position closed: {sold_date}"
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), new_notes)
-                except Exception as e:
-                    logger.error(f"Error updating Notes column: {str(e)}")
-                headers = self.worksheet.row_values(1)
-                if 'order_id' in headers:
-                    order_id_col = self.get_column_index_by_name('order_id')
-                    self.worksheet.update_cell(row_index, order_id_col, "")
+                self.local_manager.add_cell_update(row_index, 'Sold Date', sold_date)
+                self.local_manager.add_cell_update(row_index, 'Tradable', "YES")
+                
+                # Clear order_id
+                self.local_manager.add_cell_update(row_index, 'order_id', "")
+                
             elif status == "UPDATE_TP_SL":
                 if take_profit:
                     formatted_tp = format_number_for_sheet(take_profit)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), formatted_tp)
+                    self.local_manager.add_cell_update(row_index, 'Take Profit', formatted_tp)
+                    
                 if stop_loss:
                     formatted_sl = format_number_for_sheet(stop_loss)
-                    self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), formatted_sl)
-            logger.info(f"Successfully updated trade status for row {row_index}: {status}")
+                    self.local_manager.add_cell_update(row_index, 'Stop-Loss', formatted_sl)
+                    
+            logger.info(f"Successfully queued trade status updates for row {row_index}: {status}")
             return True
+            
         except Exception as e:
             logger.error(f"Error updating trade status: {str(e)}")
             return False
@@ -1764,6 +2108,11 @@ class GoogleSheetTradeManager:
                     take_profit=take_profit
                 )
                 
+                # IMMEDIATELY update Buy Signal to WAIT and Tradable to NO after successful buy
+                logger.info(f"Immediately updating Buy Signal to WAIT and Tradable to NO for {symbol}")
+                self.local_manager.add_cell_update(row_index, 'Buy Signal', "WAIT")
+                self.local_manager.add_cell_update(row_index, 'Tradable', "NO")
+                
                 # Add to active positions
                 self.active_positions[symbol] = {
                     'order_id': order_id,
@@ -1993,6 +2342,9 @@ class GoogleSheetTradeManager:
                 # Move to archive after successful sell
                 if self.move_to_archive(row_index):
                     logger.info(f"Trade cycle completed for {symbol}, moved to archive")
+                    # Mark as archived to prevent duplicate archive from TP/SL monitoring
+                    if symbol in self.active_positions:
+                        self.active_positions[symbol]['archived'] = True
                 
                 # Send Telegram notification for sell
                 self.telegram.send_message(
@@ -2127,43 +2479,67 @@ class GoogleSheetTradeManager:
                                 # Check for stop loss hit (including trailing stop)
                                 if current_price <= position['stop_loss']:
                                     logger.info(f"Stop loss triggered for {symbol} at {current_price} (stop_loss: {position['stop_loss']})")
+                                    # Mark as will be archived to prevent duplicate from other monitoring
+                                    position['archived'] = True
                                     self.execute_trade({'symbol': symbol, 'action': 'SELL', 'last_price': current_price, 'row_index': row_index, 'original_symbol': symbol.split('_')[0]})
                                 
                                 # Check for take profit hit
                                 elif 'take_profit' in position and current_price >= position['take_profit']:
                                     logger.info(f"Take profit triggered for {symbol} at {current_price} (take_profit: {position['take_profit']})")
+                                    # Mark as will be archived to prevent duplicate from other monitoring
+                                    position['archived'] = True
                                     self.execute_trade({'symbol': symbol, 'action': 'SELL', 'last_price': current_price, 'row_index': row_index, 'original_symbol': symbol.split('_')[0]})
                         except Exception as e:
                             logger.error(f"Error checking take profit/stop loss for {symbol}: {str(e)}")
                 
-                # Belirli aralıklarla aktif emirleri kontrol et - EXCHANGE ÜZERİNDE GERÇEKLEŞEN EMİRLERİ TESPİT İÇİN
+                # Check active orders at regular intervals - TO DETECT ORDERS EXECUTED ON EXCHANGE
                 current_time = time.time()
                 if current_time - last_order_check_time > order_check_interval:
-                    logger.info("Exchange üzerinde gerçekleşen emirleri kontrol ediliyor...")
-                    # İki yöntemi de kullan - daha güvenilir olması için
-                    self.check_completed_orders()  # Order history ile kontrol
-                    self.check_recent_trades()     # Trade history ile kontrol
+                    logger.info("Checking orders executed on exchange...")
+                    # Use both methods for better reliability
+                    self.check_completed_orders()  # Check via order history
+                    self.check_recent_trades()     # Check via trade history
                     last_order_check_time = current_time
-                    logger.info("Emir kontrolü tamamlandı")
+                    logger.info("Order check completed")
                 
-                # Her 10 dakikada bir TP/SL order kontrolü ve revize kontrolü
+                # Every 10 minutes TP/SL order check and revision control
                 now = time.time()
                 if now - self.last_tp_sl_revision > self.tp_sl_revision_interval:
-                    logger.info("10 dakikalık TP/SL kontrol ve revize kontrolü başlatılıyor...")
+                    logger.info("Starting 10-minute TP/SL check and revision control...")
                     
-                    # Aktif pozisyonları kontrol et
+                    # Check active positions
                     for symbol, position in list(self.active_positions.items()):
                         if position['status'] == 'POSITION_ACTIVE':
-                            # TP/SL order durumlarını kontrol et
+                            # Check TP/SL order status
                             if self.check_tp_sl_orders(symbol, position):
                                 logger.info(f"TP/SL order executed for {symbol}, position closed")
-                                continue  # Bu pozisyon kapandı, diğerine geç
+                                continue  # This position is closed, move to next
                             
-                            # Eğer pozisyon hala aktifse, TP/SL revizesi yap
+                            # If position is still active, perform TP/SL revision
                             row_index = position['row_index']
                             self.revise_tp_sl_orders(symbol, position, row_index)
                             
                     self.last_tp_sl_revision = now
+                
+                # Process batch updates at regular intervals
+                current_time = time.time()
+                if current_time - self.last_batch_update > self.batch_update_interval:
+                    logger.info("Processing batch updates to Google Sheets...")
+                    
+                    # Show pending counts before processing
+                    pending_counts = self.local_manager.get_pending_count()
+                    if sum(pending_counts.values()) > 0:
+                        logger.info(f"Pending operations: {pending_counts}")
+                        
+                        success = self.process_batch_updates()
+                        if success:
+                            logger.info("Batch updates completed successfully")
+                        else:
+                            logger.warning("Some batch updates failed, will retry later")
+                    else:
+                        logger.debug("No pending operations to process")
+                    
+                    self.last_batch_update = current_time
                 
                 # Sleep until next check
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
@@ -2176,83 +2552,148 @@ class GoogleSheetTradeManager:
             raise
 
     def move_to_archive(self, row_index):
-        """Move completed trade to archive worksheet with correct column mapping, but keep the coin in the main sheet (set Tradable=YES, Buy Signal=WAIT)"""
+        """Move completed trade to archive worksheet using local manager for batch processing"""
         try:
-            # Get the row data
-            row_data = self.worksheet.row_values(row_index)
+            logger.info(f"Starting to move trade to archive for row {row_index} (using batch system)")
             
-            # Map columns from trading sheet to archive sheet
-            archive_data = [
-                row_data[0],  # TRADE
-                row_data[1],  # Coin
-                row_data[2],  # Last Price
-                row_data[3],  # Buy Target
-                row_data[4],  # Buy Signal -> Buy Recommendation
-                row_data[5],  # Take Profit -> Sell Target
-                row_data[6],  # Stop-Loss
-                row_data[7],  # Order Placed?
-                row_data[8],  # Order Date -> Order Place Date
-                row_data[9],  # Purchase Price -> Order PURCHASE Price
-                row_data[10], # Quantity -> Order PURCHASE Quantity
-                row_data[11], # Purchase Date -> Order PURCHASE Date
-                row_data[12], # Sold? -> Order SOLD
-                row_data[13], # Sell Price -> SOLD Price
-                row_data[14], # Sell Quantity -> SOLD Quantity
-                row_data[15], # Sold Date -> SOLD Date
-                row_data[16], # Notes
-                row_data[17], # RSI
-                "Trading Bot", # Method (new column)
-                row_data[19], # Resistance Up
-                row_data[20], # Resistance Down
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Last Updated
-                row_data[22], # RSI Sparkline
-                row_data[23]  # RSI DATA
+            # Check if archive operation for this row is already pending
+            pending_operations = self.local_manager.get_batch_for_processing(max_batch_size=1000)
+            for archive_op in pending_operations['archives']:
+                if archive_op['row_index'] == row_index:
+                    logger.warning(f"Archive operation for row {row_index} already pending, skipping duplicate")
+                    return True
+            
+            # Try to get row data safely with rate limit protection
+            try:
+            row_data = self.worksheet.row_values(row_index)
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429:
+                    logger.warning(f"Rate limit hit while getting row data for archive, using fallback method")
+                    # Use local cache or estimated data if available
+                    row_data = self._get_cached_row_data(row_index)
+                else:
+                    logger.error(f"API error getting row data: {str(e)}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error getting row data for archive: {str(e)}")
+                return False
+            
+            if not row_data:
+                logger.error(f"No data found in row {row_index}")
+                return False
+            
+            logger.info(f"Retrieved row data: {len(row_data)} columns")
+            
+            # Get main worksheet headers dynamically
+            try:
+                main_headers = self.worksheet.row_values(1)
+                logger.info(f"Main worksheet headers: {main_headers}")
+            except Exception as e:
+                logger.error(f"Error getting main worksheet headers: {str(e)}")
+                return False
+            
+            # Create a mapping from header name to data value
+            def get_value_by_header(header_name, default=""):
+                """Get value from row_data by header name"""
+                try:
+                    if header_name in main_headers:
+                        index = main_headers.index(header_name)
+                        return row_data[index] if index < len(row_data) else default
+                    return default
+                except (ValueError, IndexError):
+                    return default
+            
+            # Prepare row data dictionary for archive operation using dynamic mapping
+            row_data_dict = {
+                'TRADE': get_value_by_header('TRADE'),
+                'Coin': get_value_by_header('Coin'),
+                'Last Price': get_value_by_header('Last Price'),
+                'Buy Target': get_value_by_header('Buy Target'),
+                'Buy Signal': get_value_by_header('Buy Signal'),
+                'Take Profit': get_value_by_header('Take Profit'),
+                'Stop-Loss': get_value_by_header('Stop-Loss'),
+                'Order Placed?': get_value_by_header('Order Placed?'),
+                'Order Date': get_value_by_header('Order Date'),
+                'Purchase Price': get_value_by_header('Purchase Price'),
+                'Quantity': get_value_by_header('Quantity'),
+                'Purchase Date': get_value_by_header('Purchase Date'),
+                'Sold?': get_value_by_header('Sold?'),
+                'Sell Price': get_value_by_header('Sell Price'),
+                'Sell Quantity': get_value_by_header('Sell Quantity'),
+                'Sold Date': get_value_by_header('Sold Date'),
+                'Notes': get_value_by_header('Notes'),
+                'RSI': get_value_by_header('RSI'),
+                'Resistance Up': get_value_by_header('Resistance Up'),
+                'Resistance Down': get_value_by_header('Resistance Down'),
+                'RSI Sparkline': get_value_by_header('RSI Sparkline'),
+                'RSI DATA': get_value_by_header('RSI DATA')
+            }
+            
+            # Log the mapped data for debugging
+            logger.info("Archive data mapping:")
+            for key, value in row_data_dict.items():
+                if value:  # Only log non-empty values
+                    logger.info(f"  {key}: {value}")
+            
+            # Define clear operations for trade-related columns
+            columns_to_clear = [
+                'Take Profit', 'Stop-Loss', 'Order Placed?', 'Order Date',
+                'Purchase Price', 'Quantity', 'Purchase Date', 'Sold?',
+                'Sell Price', 'Sell Quantity', 'Sold Date', 'Notes', 'order_id'
             ]
             
-            # Append to archive worksheet
-            self.archive_worksheet.append_row(archive_data)
+            # Add archive operation to local manager WITH clear operations dependency
+            self.local_manager.add_archive_operation(row_index, row_data_dict, columns_to_clear)
             
-            # Main sheet'te coin satırını silmek yerine, Tradable=YES ve Buy Signal=WAIT olarak güncelle
-            try:
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Tradable'), "YES")
-            except Exception as e:
-                logger.error(f"Error updating Tradable column: {str(e)}")
-            try:
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Buy Signal'), "WAIT")
-            except Exception as e:
-                logger.error(f"Error updating Buy Signal column: {str(e)}")
-            try:
-                # Clear all trade-related columns
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Take Profit'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Stop-Loss'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Placed?'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Order Date'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Price'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Quantity'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Purchase Date'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold?'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Price'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sell Quantity'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Sold Date'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('Notes'), "")
-                self.worksheet.update_cell(row_index, self.get_column_index_by_name('order_id'), "")
-            except Exception as e:
-                logger.error(f"Error clearing trade columns: {str(e)}")
+            # Add cell updates for main sheet instead of direct updates
+            self.local_manager.add_cell_update(row_index, 'Tradable', "YES")
+            self.local_manager.add_cell_update(row_index, 'Buy Signal', "WAIT")
             
             # Send Telegram notification
-            self.telegram.send_message(
-                f"🔄 Trade archived:\n"
-                f"Symbol: {row_data[1]}\n"
-                f"Entry: {row_data[9]}\n"
-                f"Exit: {row_data[13]}\n"
-                f"P/L: {float(row_data[13]) - float(row_data[9]) if row_data[13] and row_data[9] else 'N/A'}"
-            )
+            coin_symbol = row_data_dict.get('Coin', '')
+            entry_price = row_data_dict.get('Purchase Price', '')
+            exit_price = row_data_dict.get('Sell Price', '')
             
-            logger.info(f"Trade moved to archive: {row_data[1]}")
+            if coin_symbol:
+                try:
+                    # Calculate P/L if both prices are available
+                    pl_value = "N/A"
+                    if entry_price and exit_price:
+                        try:
+                            pl_value = f"{float(exit_price) - float(entry_price):.4f}"
+                        except ValueError:
+                            pl_value = "N/A"
+                    
+            self.telegram.send_message(
+                        f"🔄 Trade archived (queued):\n"
+                        f"Symbol: {coin_symbol}\n"
+                        f"Entry: {entry_price or 'N/A'}\n"
+                        f"Exit: {exit_price or 'N/A'}\n"
+                        f"P/L: {pl_value}\n"
+                        f"Note: Archive operation queued for batch processing"
+                    )
+                    logger.info(f"Sent Telegram notification for queued archive: {coin_symbol}")
+                except Exception as e:
+                    logger.error(f"Error sending Telegram notification: {str(e)}")
+            
+            logger.info(f"Trade archive operation queued successfully: {coin_symbol}")
             return True
+            
         except Exception as e:
-            logger.error(f"Error moving trade to archive: {str(e)}")
+            logger.error(f"Error queueing trade archive: {str(e)}")
+            logger.exception("Full traceback:")
             return False
+    
+    def _get_cached_row_data(self, row_index):
+        """Get cached row data as fallback when API calls fail"""
+        try:
+            # This could be enhanced to maintain a local cache of sheet data
+            # For now, return empty list to trigger fallback behavior
+            logger.warning(f"Using fallback method for row {row_index} data")
+            return []
+        except Exception as e:
+            logger.error(f"Error in cached row data fallback: {str(e)}")
+            return []
 
     def cancel_opposite_order(self, symbol, order_id_to_keep):
         """Cancel the opposite order (TP or SL) when one is executed"""
@@ -2296,8 +2737,8 @@ class GoogleSheetTradeManager:
 
     def get_tradingview_analysis(self, symbol):
         """
-        TradingView'dan direnç/destek ve önerilen TP/SL değerlerini alır.
-        Burada TradingViewDataProvider veya benzeri bir modül kullanılmalı.
+        Gets resistance/support levels and suggested TP/SL values from TradingView.
+        A TradingViewDataProvider or similar module should be used here.
         """
         try:
             from strategy import TradingViewDataProvider
@@ -2313,43 +2754,43 @@ class GoogleSheetTradeManager:
             else:
                 return None
         except Exception as e:
-            logger.error(f"TradingView analiz hatası: {str(e)}")
+            logger.error(f"TradingView analysis error: {str(e)}")
             return None
 
     def revise_tp_sl_orders(self, symbol, position, row_index):
         """
-        Direnç/destek seviyelerine göre TP/SL revizesi yapar.
+        Revises TP/SL orders based on resistance/support levels.
         """
         try:
             analysis = self.get_tradingview_analysis(symbol)
             if not analysis:
-                logger.warning(f"TradingView analizi alınamadı, TP/SL revizesi atlandı: {symbol}")
+                logger.warning(f"TradingView analysis could not be obtained, TP/SL revision skipped: {symbol}")
                 return False
             new_tp = analysis['take_profit']
             new_sl = analysis['stop_loss']
             current_tp = position.get('take_profit')
             current_sl = position.get('stop_loss')
-            # %1'den fazla değişim varsa revize et
+            # Revise if change is more than 1%
             tp_diff = abs(new_tp - current_tp) / max(abs(current_tp), 1e-8)
             sl_diff = abs(new_sl - current_sl) / max(abs(current_sl), 1e-8)
-            if tp_diff > 0.01 or sl_diff > 0.01:  # %1 eşik
-                logger.info(f"TP/SL revizesi başlatılıyor: {symbol} (TP değişim: {tp_diff:.4%}, SL değişim: {sl_diff:.4%})")
-                # Önce borsadaki eski TP/SL emirlerini iptal et
+            if tp_diff > 0.01 or sl_diff > 0.01:  # 1% threshold
+                logger.info(f"Starting TP/SL revision: {symbol} (TP change: {tp_diff:.4%}, SL change: {sl_diff:.4%})")
+                # First cancel old TP/SL orders on exchange
                 tp_order_id = position.get('tp_order_id')
                 sl_order_id = position.get('sl_order_id')
                 if tp_order_id:
                     try:
                         self.exchange_api.send_request("private/cancel-order", {"order_id": tp_order_id})
-                        logger.info(f"Eski TP emri iptal edildi: {tp_order_id}")
+                        logger.info(f"Old TP order cancelled: {tp_order_id}")
                     except Exception as e:
-                        logger.error(f"TP emri iptal hatası: {str(e)}")
+                        logger.error(f"TP order cancellation error: {str(e)}")
                 if sl_order_id:
                     try:
                         self.exchange_api.send_request("private/cancel-order", {"order_id": sl_order_id})
-                        logger.info(f"Eski SL emri iptal edildi: {sl_order_id}")
+                        logger.info(f"Old SL order cancelled: {sl_order_id}")
                     except Exception as e:
-                        logger.error(f"SL emri iptal hatası: {str(e)}")
-                # Yeni TP/SL emirlerini oluştur
+                        logger.error(f"SL order cancellation error: {str(e)}")
+                # Create new TP/SL orders
                 quantity = position.get('quantity')
                 actual_price = position.get('price')
                 tp_order_id, sl_order_id = self.place_tp_sl_orders(
@@ -2360,20 +2801,20 @@ class GoogleSheetTradeManager:
                     new_sl,
                     row_index
                 )
-                # Pozisyonu güncelle
+                # Update position
                 position['take_profit'] = new_tp
                 position['stop_loss'] = new_sl
                 position['tp_order_id'] = tp_order_id
                 position['sl_order_id'] = sl_order_id
-                logger.info(f"Yeni TP/SL emirleri oluşturuldu: TP={tp_order_id}, SL={sl_order_id}")
-                # Sheet'te de güncelle
+                logger.info(f"New TP/SL orders created: TP={tp_order_id}, SL={sl_order_id}")
+                # Update sheet as well
                 self.update_trade_status(
                     row_index,
                     "UPDATE_TP_SL",
                     take_profit=new_tp,
                     stop_loss=new_sl
                 )
-                # Telegram bildirimi
+                # Telegram notification
                 try:
                     logger.info("Attempting to send Telegram notification for TP/SL update...")
                     message = (
@@ -2389,14 +2830,13 @@ class GoogleSheetTradeManager:
                     logger.info("Telegram notification sent successfully")
                 except Exception as e:
                     logger.error(f"Failed to send Telegram notification: {str(e)}")
-                    logger.error(f"Bot token: {self.telegram.bot_token[:5]}...")
-                    logger.error(f"Chat ID: {self.telegram.chat_id}")
+                    # Don't log sensitive information like bot token in production
                 return True
             else:
-                logger.info(f"TP/SL değişimi %1'den az, revize edilmedi: {symbol}")
+                logger.info(f"TP/SL change less than 1%, not revised: {symbol}")
                 return False
         except Exception as e:
-            logger.error(f"TP/SL revize hatası: {str(e)}")
+            logger.error(f"TP/SL revision error: {str(e)}")
             return False
 
     def check_tp_sl_orders(self, symbol, position):
@@ -2487,28 +2927,27 @@ class GoogleSheetTradeManager:
 
     def check_completed_orders(self):
         """
-        TP/SL emirlerinin tamamlanıp tamamlanmadığını 'private/get-order-history' API'sini 
-        kullanarak kontrol eder
+        Checks whether TP/SL orders have been completed using the 'private/get-order-history' API
         """
         try:
-            current_time = int(time.time() * 1000)  # Milisaniye cinsinden şu anki zaman
+            current_time = int(time.time() * 1000)  # Current time in milliseconds
             
-            # Aktif pozisyonları kontrol et
+            # Check active positions
             for symbol, position in list(self.active_positions.items()):
                 tp_order_id = position.get('tp_order_id')
                 sl_order_id = position.get('sl_order_id')
                 
                 if not tp_order_id and not sl_order_id:
-                    continue  # TP/SL emri yoksa atla
+                    continue  # Skip if no TP/SL orders
                 
-                # Son 1 saat içindeki emirleri sorgula
+                # Query orders from last 1 hour
                 one_hour_ago = current_time - (60 * 60 * 1000)
                 
                 params = {
                     "instrument_name": symbol,
                     "start_time": one_hour_ago,
                     "end_time": current_time,
-                    "limit": 50  # Son 50 emri getir
+                    "limit": 50  # Get last 50 orders
                 }
                 
                 response = self.exchange_api.send_request("private/get-order-history", params)
@@ -2520,43 +2959,43 @@ class GoogleSheetTradeManager:
                         order_id = order.get("order_id")
                         status = order.get("status")
                         
-                        # Bu emir bizim TP veya SL emri mi ve tamamlandı mı?
+                        # Is this order our TP or SL order and is it completed?
                         if order_id in [tp_order_id, sl_order_id] and status == "FILLED":
-                            logger.info(f"Tamamlanan emir tespit edildi: {order_id} ({status}) for {symbol}")
+                            logger.info(f"Completed order detected: {order_id} ({status}) for {symbol}")
                             
-                            # İşlem tipini belirle (TP veya SL)
+                            # Determine order type (TP or SL)
                             order_type = "TP" if order_id == tp_order_id else "SL"
                             
-                            # Pozisyonu kapat ve diğer emirleri iptal et
+                            # Close position and cancel other orders
                             self.handle_position_closed(symbol, position, order_type)
                             break
         except Exception as e:
-            logger.error(f"check_completed_orders sırasında hata: {str(e)}")
+            logger.error(f"Error during check_completed_orders: {str(e)}")
     
     def check_recent_trades(self):
         """
-        Son gerçekleşen işlemleri 'private/get-trades' API'sini kullanarak kontrol ederek 
-        TP/SL tetiklenmelerini tespit eder
+        Checks recent executed trades using the 'private/get-trades' API 
+        to detect TP/SL triggers
         """
         try:
-            current_time = int(time.time() * 1000)  # Milisaniye cinsinden şu anki zaman
+            current_time = int(time.time() * 1000)  # Current time in milliseconds
             
-            # Aktif pozisyonları kontrol et
+            # Check active positions
             for symbol, position in list(self.active_positions.items()):
                 tp_order_id = position.get('tp_order_id')
                 sl_order_id = position.get('sl_order_id')
                 
                 if not tp_order_id and not sl_order_id:
-                    continue  # TP/SL emri yoksa atla
+                    continue  # Skip if no TP/SL orders
                     
-                # Son 15 dakika içindeki işlemleri sorgula
+                # Query trades from last 15 minutes
                 fifteen_mins_ago = current_time - (15 * 60 * 1000)
                 
                 params = {
                     "instrument_name": symbol,
                     "start_time": fifteen_mins_ago,
                     "end_time": current_time,
-                    "limit": 20  # Son 20 işlemi getir
+                    "limit": 20  # Get last 20 trades
                 }
                 
                 response = self.exchange_api.send_request("private/get-trades", params)
@@ -2568,46 +3007,46 @@ class GoogleSheetTradeManager:
                         order_id = trade.get("order_id")
                         side = trade.get("side")
                         
-                        # Bu işlem bizim TP veya SL emirlerinden birine ait mi?
+                        # Does this trade belong to one of our TP or SL orders?
                         if order_id in [tp_order_id, sl_order_id] and side == "SELL":
-                            logger.info(f"Gerçekleşen işlem tespit edildi: order_id={order_id}, trade_id={trade.get('trade_id')} for {symbol}")
+                            logger.info(f"Executed trade detected: order_id={order_id}, trade_id={trade.get('trade_id')} for {symbol}")
                             
-                            # İşlem tipini belirle (TP veya SL)
+                            # Determine order type (TP or SL)
                             order_type = "TP" if order_id == tp_order_id else "SL"
                             
-                            # Pozisyonu kapat ve diğer emirleri iptal et
+                            # Close position and cancel other orders
                             self.handle_position_closed(symbol, position, order_type)
                             break
         except Exception as e:
-            logger.error(f"check_recent_trades sırasında hata: {str(e)}")
+            logger.error(f"Error during check_recent_trades: {str(e)}")
     
     def handle_position_closed(self, symbol, position, order_type):
         """
-        Pozisyonun kapandığı tespit edildiğinde yapılacak işlemler
+        Actions to be taken when a position is detected as closed
         
         Args:
-            symbol (str): İşlem çifti (örn. BTC_USDT)
-            position (dict): Pozisyon bilgileri
-            order_type (str): Gerçekleşen emir tipi - "TP" veya "SL"
+            symbol (str): Trading pair (e.g. BTC_USDT)
+            position (dict): Position information
+            order_type (str): Executed order type - "TP" or "SL"
         """
         try:
             row_index = position['row_index']
             
-            # Hangi emrin gerçekleştiğini kaydet
+            # Record which order was executed
             executed_order_id = position.get('tp_order_id') if order_type == "TP" else position.get('sl_order_id')
             cancel_order_id = position.get('sl_order_id') if order_type == "TP" else position.get('tp_order_id')
             
-            logger.info(f"{symbol} için {order_type} emri gerçekleşti (order_id: {executed_order_id})")
+            logger.info(f"{order_type} order executed for {symbol} (order_id: {executed_order_id})")
             
-            # Diğer açık emri iptal et
+            # Cancel the other open order
             if cancel_order_id:
                 try:
                     self.exchange_api.send_request("private/cancel-order", {"order_id": cancel_order_id})
-                    logger.info(f"Karşıt emir iptal edildi: {cancel_order_id}")
+                    logger.info(f"Opposite order cancelled: {cancel_order_id}")
                 except Exception as e:
-                    logger.error(f"Emir iptal hatası: {str(e)}")
+                    logger.error(f"Order cancellation error: {str(e)}")
             
-            # Gerçekleşen emrin detaylarını al
+            # Get details of the executed order
             try:
                 order_detail = self.exchange_api.send_request("private/get-order-detail", {"order_id": executed_order_id})
                 
@@ -2616,7 +3055,7 @@ class GoogleSheetTradeManager:
                     avg_price = float(result.get("avg_price", 0))
                     cumulative_quantity = float(result.get("cumulative_quantity", 0))
                     
-                    # Sheette trade'i güncelle
+                    # Update trade in sheet
                     self.update_trade_status(
                         row_index, 
                         "SOLD", 
@@ -2625,40 +3064,400 @@ class GoogleSheetTradeManager:
                         sell_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     )
                     
-                    logger.info(f"Gerçekleşen emir detayları: fiyat={avg_price}, miktar={cumulative_quantity}")
+                    logger.info(f"Executed order details: price={avg_price}, quantity={cumulative_quantity}")
                 else:
-                    logger.warning(f"Emir detayları alınamadı, varsayılan değerlerle güncelleniyor")
-                    # Detay alınamazsa varsayılan olarak normal güncelleme yap
+                    logger.warning(f"Order details could not be retrieved, updating with default values")
+                    # If details cannot be retrieved, update with default values
                     self.update_trade_status(row_index, "SOLD")
             except Exception as e:
-                logger.error(f"Emir detayı alma hatası: {str(e)}")
-                # Hata olsa bile sheette işlemi güncelle
+                logger.error(f"Order detail retrieval error: {str(e)}")
+                # Even if there's an error, update the trade in sheet
                 self.update_trade_status(row_index, "SOLD")
             
-            # İşlemi arşive taşı
-            self.move_to_archive(row_index)
+            # Check if position is already archived to prevent duplicates
+            position_archived = position.get('archived', False)
+            if not position_archived:
+                # Move trade to archive only if not already archived
+                try:
+                    if self.move_to_archive(row_index):
+                        logger.info(f"Trade archived successfully for {symbol} via {order_type} execution")
+                        # Mark as archived in case position still exists
+                        if symbol in self.active_positions:
+                            self.active_positions[symbol]['archived'] = True
+                    else:
+                        logger.warning(f"Failed to archive trade for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error archiving trade for {symbol}: {str(e)}")
+            else:
+                logger.info(f"Trade for {symbol} already archived, skipping duplicate archive")
             
-            # Aktif pozisyonlardan kaldır
+            # Remove from active positions
             if symbol in self.active_positions:
                 del self.active_positions[symbol]
             
-            # Telegram bildirimi gönder
+            # Send Telegram notification
             self.telegram.send_message(
-                f"{'🟢 Take Profit' if order_type == 'TP' else '🔴 Stop Loss'} Gerçekleşti:\n"
+                f"{'🟢 Take Profit' if order_type == 'TP' else '🔴 Stop Loss'} Executed:\n"
                 f"Symbol: {symbol}\n"
                 f"Order ID: {executed_order_id}\n"
-                f"Not: Bu işlem exchange üzerinde otomatik olarak gerçekleşmiştir ve sistem tarafından tespit edilmiştir."
+                f"Note: This trade was automatically executed on the exchange and detected by the system."
             )
             
             return True
         except Exception as e:
-            logger.error(f"handle_position_closed sırasında hata: {str(e)}")
+            logger.error(f"Error during handle_position_closed: {str(e)}")
+            return False
+
+    def process_batch_updates(self):
+        """Process pending batch updates to Google Sheets"""
+        try:
+            pending_counts = self.local_manager.get_pending_count()
+            total_pending = sum(pending_counts.values())
+            
+            if total_pending == 0:
+                return True
+            
+            logger.info(f"Processing batch updates: {pending_counts}")
+            
+            # Get batch for processing
+            batch = self.local_manager.get_batch_for_processing(max_batch_size=15)
+            
+            completed_ids = []
+            failed_ids = []
+            
+            try:
+                # Process cell updates
+                if batch['updates']:
+                    success = self._process_cell_updates_batch(batch['updates'])
+                    if success:
+                        completed_ids.extend([u['id'] for u in batch['updates']])
+                        logger.info(f"Successfully processed {len(batch['updates'])} cell updates")
+                    else:
+                        failed_ids.extend([u['id'] for u in batch['updates']])
+                
+                # Process archive operations
+                if batch['archives']:
+                    logger.info(f"Found {len(batch['archives'])} archive operations to process")
+                    
+                    # Safety check: ensure archive worksheet is properly initialized
+                    if not self.archive_worksheet:
+                        logger.error("Archive worksheet not available! Attempting to reinitialize...")
+                        try:
+                            # Try to get archive worksheet again
+                            self.archive_worksheet = self.sheet.worksheet(self.archive_worksheet_name)
+                            if not self.archive_worksheet:
+                                logger.error("Failed to reinitialize archive worksheet")
+                                failed_ids.extend([a['id'] for a in batch['archives']])
+                                # Skip archive processing for this batch
+                                success = False
+                            else:
+                    success = self._process_archive_batch(batch['archives'])
+                        except Exception as e:
+                            logger.error(f"Error reinitializing archive worksheet: {str(e)}")
+                            failed_ids.extend([a['id'] for a in batch['archives']])
+                            # Skip archive processing for this batch
+                            success = False
+                    else:
+                        # Verify archive worksheet has headers
+                        try:
+                            headers = self.archive_worksheet.row_values(1)
+                            if not headers or len(headers) < 10:
+                                logger.warning("Archive worksheet headers missing, setting up headers...")
+                                self._setup_archive_headers()
+                        except Exception as e:
+                            logger.error(f"Error checking archive headers: {str(e)}")
+                            
+                        success = self._process_archive_batch(batch['archives'])
+                    
+                    if success:
+                        completed_ids.extend([a['id'] for a in batch['archives']])
+                        logger.info(f"Successfully processed {len(batch['archives'])} archive operations")
+                    else:
+                        failed_ids.extend([a['id'] for a in batch['archives']])
+                        logger.error(f"Failed to process {len(batch['archives'])} archive operations")
+                else:
+                    logger.debug("No archive operations to process")
+                
+                # Process clear operations
+                if batch['clears']:
+                    success = self._process_clear_batch(batch['clears'])
+                    if success:
+                        completed_ids.extend([c['id'] for c in batch['clears']])
+                        logger.info(f"Successfully processed {len(batch['clears'])} clear operations")
+                    else:
+                        failed_ids.extend([c['id'] for c in batch['clears']])
+                
+                # Mark operations as completed or failed
+                if completed_ids:
+                    self.local_manager.mark_batch_completed(completed_ids)
+                    
+                if failed_ids:
+                    self.local_manager.mark_batch_failed(failed_ids)
+                
+                return len(failed_ids) == 0
+                
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429:
+                    logger.warning("Rate limit hit during batch processing, will retry later")
+                    self.local_manager.mark_batch_failed([u['id'] for u in batch['updates']] + 
+                                                       [a['id'] for a in batch['archives']] + 
+                                                       [c['id'] for c in batch['clears']])
+                    time.sleep(self.rate_limit_wait_time)
+                    return False
+                else:
+                    logger.error(f"API error during batch processing: {str(e)}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error during batch processing: {str(e)}")
+            return False
+    
+    def _process_cell_updates_batch(self, updates):
+        """Process a batch of cell updates"""
+        try:
+            # Group updates by row for efficiency
+            updates_by_row = defaultdict(list)
+            for update in updates:
+                updates_by_row[update['row_index']].append(update)
+            
+            # Process each row
+            for row_index, row_updates in updates_by_row.items():
+                try:
+                    for update in row_updates:
+                        column_index = self.get_column_index_by_name(update['column'])
+                        self.worksheet.update_cell(row_index, column_index, update['value'])
+                        time.sleep(0.1)  # Small delay between updates
+                        
+                except Exception as e:
+                    logger.error(f"Error updating row {row_index}: {str(e)}")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in _process_cell_updates_batch: {str(e)}")
+            return False
+    
+    def _process_archive_batch(self, archives):
+        """Process a batch of archive operations"""
+        try:
+            logger.info(f"Starting to process {len(archives)} archive operations")
+            
+            # Check if archive worksheet is available
+            if not self.archive_worksheet:
+                logger.error("Archive worksheet is not available!")
+                return False
+            
+            logger.info(f"Archive worksheet title: {self.archive_worksheet.title}")
+            
+            # DEBUG: Check archive worksheet headers
+            try:
+                headers = self.archive_worksheet.row_values(1)
+                logger.info(f"Archive worksheet headers: {headers}")
+                if not headers:
+                    logger.warning("Archive worksheet has no headers!")
+                    # Set archive headers
+                    archive_headers = [
+                        "TRADE", "Coin", "Last Price", "Buy Target", "Buy Recommendation",
+                        "Sell Target", "Stop-Loss", "Order Placed?", "Order Place Date",
+                        "Order PURCHASE Price", "Order PURCHASE Quantity", "Order PURCHASE Date",
+                        "Order SOLD", "SOLD Price", "SOLD Quantity", "SOLD Date", "Notes",
+                        "RSI", "Method", "Resistance Up", "Resistance Down", "Last Updated",
+                        "RSI Sparkline", "RSI DATA"
+                    ]
+                    self.archive_worksheet.update('A1', [archive_headers])
+                    logger.info("Archive worksheet headers created")
+            except Exception as e:
+                logger.error(f"Error checking archive headers: {str(e)}")
+            
+            for i, archive in enumerate(archives):
+                try:
+                    logger.info(f"Processing archive {i+1}/{len(archives)} for row {archive['row_index']}")
+                    
+                    # Convert row_data dict to list format expected by append_row
+                    row_data = archive['row_data']
+                    
+                    # DEBUG: Log the row data being archived
+                    logger.debug(f"Archive row_data keys: {list(row_data.keys())}")
+                    logger.debug(f"Archive row_data values: {list(row_data.values())}")
+                    
+                    # Create archive_data in EXACT order matching archive headers
+                    # Archive headers order: TRADE, Coin, Last Price, Buy Target, Buy Recommendation, Sell Target, Stop-Loss, Order Placed?, Order Place Date, Order PURCHASE Price, Order PURCHASE Quantity, Order PURCHASE Date, Order SOLD, SOLD Price, SOLD Quantity, SOLD Date, Notes, RSI, Method, Resistance Up, Resistance Down, Last Updated, RSI Sparkline, RSI DATA
+                    archive_data = [
+                        row_data.get('TRADE', ''),                    # 0: TRADE
+                        row_data.get('Coin', ''),                     # 1: Coin
+                        row_data.get('Last Price', ''),               # 2: Last Price
+                        row_data.get('Buy Target', ''),               # 3: Buy Target
+                        row_data.get('Buy Signal', ''),               # 4: Buy Recommendation
+                        row_data.get('Take Profit', ''),              # 5: Sell Target
+                        row_data.get('Stop-Loss', ''),                # 6: Stop-Loss
+                        row_data.get('Order Placed?', ''),            # 7: Order Placed?
+                        row_data.get('Order Date', ''),               # 8: Order Place Date
+                        row_data.get('Purchase Price', ''),           # 9: Order PURCHASE Price
+                        row_data.get('Quantity', ''),                 # 10: Order PURCHASE Quantity
+                        row_data.get('Purchase Date', ''),            # 11: Order PURCHASE Date
+                        row_data.get('Sold?', ''),                    # 12: Order SOLD
+                        row_data.get('Sell Price', ''),               # 13: SOLD Price
+                        row_data.get('Sell Quantity', ''),            # 14: SOLD Quantity
+                        row_data.get('Sold Date', ''),                # 15: SOLD Date
+                        row_data.get('Notes', ''),                    # 16: Notes
+                        row_data.get('RSI', ''),                      # 17: RSI
+                        'Trading Bot',                                # 18: Method
+                        row_data.get('Resistance Up', ''),            # 19: Resistance Up
+                        row_data.get('Resistance Down', ''),          # 20: Resistance Down
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # 21: Last Updated
+                        row_data.get('RSI Sparkline', ''),            # 22: RSI Sparkline
+                        row_data.get('RSI DATA', '')                  # 23: RSI DATA
+                    ]
+                    
+                    # DEBUG: Log the formatted archive data
+                    logger.info(f"Archive data prepared for {row_data.get('Coin', 'Unknown')}: {len(archive_data)} columns")
+                    logger.debug(f"Archive data array: {archive_data}")
+                    
+                    # Verify data alignment by checking key values
+                    logger.info(f"Archive data verification:")
+                    logger.info(f"  Coin (index 1): {archive_data[1]}")
+                    logger.info(f"  Purchase Price (index 9): {archive_data[9]}")
+                    logger.info(f"  Sell Price (index 13): {archive_data[13]}")
+                    logger.info(f"  Method (index 18): {archive_data[18]}")
+                    
+                    # Find the first empty row in archive sheet instead of using append_row
+                    try:
+                        # Get all values to find the first empty row
+                        all_values = self.archive_worksheet.get_all_values()
+                        
+                        # Find the first truly empty row using strict criteria
+                        target_row = None
+                        logger.info(f"Total rows in archive sheet: {len(all_values)}")
+                        
+                        for row_idx, row_values in enumerate(all_values):
+                            # Skip header row (index 0)
+                            if row_idx == 0:
+                                continue
+                            
+                            # Strict empty row detection: Check key columns
+                            # Key columns: TRADE (0), Coin (1), Last Price (2), Buy Target (3)
+                            is_truly_empty = True
+                            
+                            if row_values and len(row_values) > 3:
+                                # Check first 4 key columns - if ANY has data, row is not empty
+                                key_columns = [0, 1, 2, 3]  # TRADE, Coin, Last Price, Buy Target
+                                for col_idx in key_columns:
+                                    if col_idx < len(row_values):
+                                        cell_value = str(row_values[col_idx]).strip()
+                                        if cell_value:
+                                            is_truly_empty = False
+                                            break
+                            elif row_values:
+                                # Fallback: check if any cell has data
+                                is_truly_empty = all(not str(cell).strip() for cell in row_values)
+                            
+                            if is_truly_empty:
+                                target_row = row_idx + 1  # +1 for 1-based indexing
+                                logger.info(f"✅ Found truly empty row at index {row_idx} (1-based: {target_row})")
+                                break
+                            else:
+                                # Log occupied rows for debugging
+                                key_data = []
+                                if row_values and len(row_values) > 3:
+                                    key_data = [str(row_values[i]).strip() if i < len(row_values) else "" for i in range(4)]
+                                logger.debug(f"Row {row_idx + 1} occupied - Key columns: {key_data}")
+                        
+                        # If no empty row found, append to the end
+                        if target_row is None:
+                            target_row = len(all_values) + 1
+                            logger.info(f"❌ No empty row found, appending to end at row {target_row}")
+                        
+                        logger.info(f"🎯 Final decision: Writing archive data to row {target_row}")
+                        
+                        # Calculate the range for the row (A to X for 24 columns)
+                        end_column = chr(ord('A') + len(archive_data) - 1)  # Dynamic end column
+                        range_name = f"A{target_row}:{end_column}{target_row}"
+                        
+                        logger.info(f"📍 Archive range: {range_name}")
+                        
+                        # Write to the specific row using batch update
+                        result = self.archive_worksheet.update(range_name, [archive_data], value_input_option='USER_ENTERED')
+                        
+                        # DEBUG: Log the update result
+                        logger.info(f"Archive update result: {result}")
+                        
+                        # Verify the data was written correctly
+                        time.sleep(1)  # Small delay to ensure write is complete
+                        
+                        # Read back the specific row to verify
+                        written_row = self.archive_worksheet.row_values(target_row)
+                        logger.info(f"Verification - Written row {target_row}: {written_row[:5]}...")  # First 5 values
+                        
+                        # Check if our data matches
+                        if written_row and len(written_row) > 1 and written_row[1] == archive_data[1]:
+                            logger.info(f"✅ Archive data successfully written to row {target_row} for {archive_data[1]}")
+                        else:
+                            logger.error(f"❌ Archive data verification failed for row {target_row}")
+                            logger.error(f"Expected coin: {archive_data[1]}, Found: {written_row[1] if written_row and len(written_row) > 1 else 'N/A'}")
+                            return False
+                            
+                    except Exception as e:
+                        logger.error(f"Error writing to archive sheet: {str(e)}")
+                        logger.exception("Archive write error details:")
+                        return False
+                    
+                    logger.info(f"Successfully appended row to archive worksheet for {row_data.get('Coin', 'Unknown')}")
+                    
+                    time.sleep(0.5)  # Delay between archive operations
+                    
+                    # After successful archive, add clear operations if specified
+                    columns_to_clear = archive.get('columns_to_clear', [])
+                    if columns_to_clear:
+                        self.local_manager.add_clear_operations(archive['row_index'], columns_to_clear)
+                        logger.info(f"Added clear operations for row {archive['row_index']} after successful archive")
+                    
+                except Exception as e:
+                    logger.error(f"Error archiving row {archive['row_index']}: {str(e)}")
+                    logger.exception("Archive error details:")
+                    return False
+                    
+            logger.info(f"Successfully processed all {len(archives)} archive operations")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in _process_archive_batch: {str(e)}")
+            logger.exception("Archive batch error details:")
+            return False
+    
+    def _process_clear_batch(self, clears):
+        """Process a batch of clear operations"""
+        try:
+            # Group clears by row
+            clears_by_row = defaultdict(list)
+            for clear in clears:
+                clears_by_row[clear['row_index']].extend(clear['columns'])
+            
+            # Process each row
+            for row_index, columns in clears_by_row.items():
+                try:
+                    # Remove duplicates
+                    unique_columns = list(set(columns))
+                    
+                    for column in unique_columns:
+                        column_index = self.get_column_index_by_name(column)
+                        self.worksheet.update_cell(row_index, column_index, "")
+                        time.sleep(0.1)  # Small delay between updates
+                        
+                except Exception as e:
+                    logger.error(f"Error clearing row {row_index}: {str(e)}")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in _process_clear_batch: {str(e)}")
             return False
 
 def format_quantity_for_coin(symbol, quantity):
-    # Burada coin bazında hassasiyet belirleyebilirsiniz
-    integer_coins = ["LDO", "SUI", "BONK", "SHIB", "DOGE", "PEPE"]  # Gerekirse güncelle
-    two_decimal_coins = ["BTC", "ETH", "SOL", "LTC", "XRP"]  # Gerekirse güncelle
+    # Here you can specify precision based on coin type
+    integer_coins = ["LDO", "SUI", "BONK", "SHIB", "DOGE", "PEPE"]  # Update if needed
+    two_decimal_coins = ["BTC", "ETH", "SOL", "LTC", "XRP"]  # Update if needed
 
     base = symbol.split('_')[0]
     if base in integer_coins:
@@ -2666,7 +3465,7 @@ def format_quantity_for_coin(symbol, quantity):
     elif base in two_decimal_coins:
         return "{:.2f}".format(quantity)
     else:
-        # Default: 2 ondalık
+        # Default: 2 decimals
         return "{:.2f}".format(quantity)
 
 if __name__ == "__main__":

@@ -69,6 +69,10 @@ class TradingViewDataProvider:
         # ATR verilerini saklamak için cache oluştur
         self.atr_cache = {}  # {symbol: {'atr': value, 'timestamp': last_update_time}}
         
+        # Volume tracking için dictionary oluştur
+        self.last_volumes = {}  # {symbol: [volume1, volume2, ...]}
+        self.volume_history_size = 14  # Son 14 mum için volume ortalaması hesapla
+        
         logger.info(f"Initialized CCXT with exchange: {exchange_id}, interval: {self.interval}")
     
     def _format_symbol(self, symbol):
@@ -186,6 +190,24 @@ class TradingViewDataProvider:
             # OHLCV verileri düzenle (timestamp, open, high, low, close, volume)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
+            # Volume verilerini kaydet
+            if len(df) > 0:
+                # Son 14 mum hariç diğer volume değerlerini al
+                recent_volumes = df['volume'].values[:-1]
+                if len(recent_volumes) > self.volume_history_size:
+                    recent_volumes = recent_volumes[-self.volume_history_size:]
+                
+                # Symbol için volume geçmişini güncelle - original symbol formatı kullan
+                # Symbol'ü normalize et (BTC/USDT -> BTC_USDT formatına)
+                normalized_symbol = symbol.replace("/", "_")
+                if normalized_symbol not in self.last_volumes:
+                    self.last_volumes[normalized_symbol] = list(recent_volumes)
+                else:
+                    # Mevcut listeyi güncelle, maksimum uzunluğu koru
+                    self.last_volumes[normalized_symbol].extend(recent_volumes)
+                    if len(self.last_volumes[normalized_symbol]) > self.volume_history_size:
+                        self.last_volumes[normalized_symbol] = self.last_volumes[normalized_symbol][-self.volume_history_size:]
+            
             return df
         except Exception as e:
             logger.error(f"OHLCV verisi alınamadı {symbol}: {str(e)}")
@@ -228,6 +250,10 @@ class TradingViewDataProvider:
             ema10 = self._calculate_ema(closes, 10) if len(closes) >= 10 else last_price * 0.95
             atr = self._calculate_atr(highs, lows, closes, self.atr_period)
             
+            # Volume verilerini ekle
+            volumes = data['volume'].values
+            current_volume = volumes[-1]
+            
             # TradingView formatında veri oluştur - diğer kodun beklediği yapıda
             indicators = {
                 "close": last_price,
@@ -237,7 +263,8 @@ class TradingViewDataProvider:
                 "SMA200": ma200,
                 "SMA50": ma50,
                 "EMA10": ema10,
-                "ATR": atr
+                "ATR": atr,
+                "volume": current_volume
             }
             
             # Çalışan formatı önbelleğe al
@@ -278,6 +305,10 @@ class TradingViewDataProvider:
                 ema10 = self._calculate_ema(closes, 10) if len(closes) >= 10 else last_price * 0.95
                 atr = self._calculate_atr(highs, lows, closes, self.atr_period)
                 
+                # Volume verilerini ekle
+                volumes = data['volume'].values
+                current_volume = volumes[-1]
+                
                 # TradingView formatında veri oluştur
                 indicators = {
                     "close": last_price,
@@ -287,7 +318,8 @@ class TradingViewDataProvider:
                     "SMA200": ma200,
                     "SMA50": ma50,
                     "EMA10": ema10,
-                    "ATR": atr
+                    "ATR": atr,
+                    "volume": current_volume
                 }
                 
                 logger.info(f"[SUCCESS] Found data with {ccxt_symbol}")
@@ -328,6 +360,10 @@ class TradingViewDataProvider:
                 ema10 = self._calculate_ema(closes, 10) if len(closes) >= 10 else last_price * 0.95
                 atr = self._calculate_atr(highs, lows, closes, self.atr_period)
                 
+                # Volume verilerini ekle
+                volumes = data['volume'].values
+                current_volume = volumes[-1]
+                
                 # TradingView formatında veri oluştur
                 indicators = {
                     "close": last_price,
@@ -337,7 +373,8 @@ class TradingViewDataProvider:
                     "SMA200": ma200,
                     "SMA50": ma50,
                     "EMA10": ema10,
-                    "ATR": atr
+                    "ATR": atr,
+                    "volume": current_volume
                 }
                 
                 logger.info(f"Using cached format {format_to_use} success!")
@@ -380,6 +417,43 @@ class TradingViewDataProvider:
             "support": indicators.get("low", 0) * 0.95,
         }
         
+        # Calculate volume ratio if volume data is available
+        if "volume" in indicators:
+            # Get current volume
+            current_volume = indicators["volume"]
+            logger.debug(f"Current volume for {original_symbol}: {current_volume}")
+            
+            # Calculate average volume (if we have enough data points)
+            avg_volume = 0
+            # Symbol'ü normalize et (TradingView formatı)
+            normalized_original = original_symbol.replace("/", "_")
+            
+            if hasattr(self, 'last_volumes') and normalized_original in self.last_volumes:
+                volume_history = self.last_volumes[normalized_original]
+                if len(volume_history) > 0:
+                    avg_volume = sum(volume_history) / len(volume_history)
+                    logger.debug(f"Average volume for {normalized_original}: {avg_volume} (based on {len(volume_history)} periods)")
+                else:
+                    logger.debug(f"Volume history for {normalized_original} is empty")
+            else:
+                logger.debug(f"No volume history found for {normalized_original}")
+                # İlk defa işlenen coin için geçici ortalama kullan
+                if current_volume > 0:
+                    avg_volume = current_volume  # İlk değer olarak current volume'u kullan
+                    logger.debug(f"Using current volume as initial average for {normalized_original}")
+            
+            # Calculate volume ratio
+            volume_ratio = 0
+            if avg_volume > 0:
+                volume_ratio = current_volume / avg_volume
+                logger.info(f"Volume ratio for {original_symbol}: {volume_ratio:.4f} (current: {current_volume}, avg: {avg_volume})")
+            else:
+                logger.warning(f"Cannot calculate volume ratio for {original_symbol}: avg_volume is 0")
+            
+            # Add to data dictionary
+            data["volume"] = current_volume
+            data["volume_ratio"] = volume_ratio
+        
         # Analyze conditions
         data["ma200_valid"] = data["last_price"] > data["ma200"]
         data["ma50_valid"] = data["last_price"] > data["ma50"]
@@ -391,9 +465,11 @@ class TradingViewDataProvider:
         # Buy signal (DAHA KATI KOŞULLAR):
         # 1) RSI < 40 ve en az 2 hareketli ortalama koşulu sağlanırsa AL
         # 2) VEYA RSI < 30 ve en az 1 hareketli ortalama koşulu sağlanırsa AL
+        # 3) Yeni kriter: RSI < 45 ve en az 1 hareketli ortalama koşulu ve volume_ratio >= 1.5
         data["buy_signal"] = (
             (data["rsi"] < 40 and valid_ma_count >= 2) or  # Normal alış durumu
-            (data["rsi"] < 30 and valid_ma_count >= 1)  # Aşırı satış durumu - en az 1 MA koşulu ile
+            (data["rsi"] < 30 and valid_ma_count >= 1) or  # Aşırı satış durumu - en az 1 MA koşulu ile
+            (data["rsi"] < 45 and valid_ma_count >= 1 and data.get("volume_ratio", 0) >= 1.5)  # Yeni kriter: Volume 1.5x ve 1 MA
         )
         
         # Sell signal: RSI > 70 and price breaks resistance
@@ -499,6 +575,9 @@ class GoogleSheetIntegration:
         # Initialize with empty values
         self._prev_symbol_set = self._get_current_symbols()
         logger.info(f"Initial coin list created with {len(self._prev_symbol_set)} coins")
+        
+        # Ensure required columns exist
+        self.ensure_required_columns_exist()
         
         logger.info(f"Connected to Google Sheet: {self.sheet.title}")
     
@@ -744,7 +823,7 @@ class GoogleSheetIntegration:
             row_values = self.worksheet.row_values(row_index)
             
             # Map to our expected column indices (if row doesn't have enough values, return empty dict)
-            if len(row_values) < 33:  # We need at least up to column AF (33 columns)
+            if len(row_values) < 36:  # We need at least up to column AJ (36 columns) for volume data
                 return {}
                 
             # Map the values to our expected structure
@@ -763,7 +842,9 @@ class GoogleSheetIntegration:
                 "ma50": row_values[25] if len(row_values) > 25 else "",         # Column Z
                 "ema10": row_values[26] if len(row_values) > 26 else "",        # Column AA
                 "ma50_valid": row_values[27] if len(row_values) > 27 else "",   # Column AB
-                "ema10_valid": row_values[28] if len(row_values) > 28 else ""   # Column AC
+                "ema10_valid": row_values[28] if len(row_values) > 28 else "",  # Column AC
+                "volume": row_values[34] if len(row_values) > 34 else "",       # Column AI (35)
+                "volume_ratio": row_values[35] if len(row_values) > 35 else ""  # Column AJ (36)
             }
             
             # Cache the values for future use
@@ -839,6 +920,19 @@ class GoogleSheetIntegration:
             # If conversion fails, consider it changed
             changes.append("RSI: conversion error")
         
+        # Check volume ratio change - important for signals
+        try:
+            curr_volume_ratio = float(current_values.get("volume_ratio", "0").replace(',', '.'))
+            new_volume_ratio = float(new_values["volume_ratio"])
+            # If volume ratio change is significant (20% or ratio crosses 1.5 threshold)
+            if (abs(curr_volume_ratio - new_volume_ratio) > 0.3 or 
+                (curr_volume_ratio < 1.5 <= new_volume_ratio) or 
+                (new_volume_ratio < 1.5 <= curr_volume_ratio)):
+                changes.append(f"Volume Ratio: {curr_volume_ratio:.2f} -> {new_volume_ratio:.2f}")
+        except:
+            # If conversion fails, consider it changed
+            changes.append("Volume Ratio: conversion error")
+        
         # Check MA50 change
         try:
             curr_ma50 = float(current_values.get("ma50", "0").replace(',', '.'))
@@ -908,6 +1002,10 @@ class GoogleSheetIntegration:
                 {"row": row_index, "col": 31, "value": "TradingView"},
                 # Enable Margin Trading (column AF)
                 {"row": row_index, "col": 32, "value": "NO"},
+                # Volume (column AI = 35)
+                {"row": row_index, "col": 35, "value": data.get("volume", 0)},
+                # Volume Ratio (column AJ = 36)
+                {"row": row_index, "col": 36, "value": data.get("volume_ratio", 0)},
                 # Buy Signal (column E)
                 {"row": row_index, "col": 5, "value": data["action"] if data["action"] == "BUY" else ("WAIT" if data["action"] == "WAIT" else data["action"])}
             ]
@@ -940,7 +1038,9 @@ class GoogleSheetIntegration:
                 "ma50": str(data["ma50"]),
                 "ema10": str(data["ema10"]),
                 "ma50_valid": "YES" if data["ma50_valid"] else "NO",
-                "ema10_valid": "YES" if data["ema10_valid"] else "NO"
+                "ema10_valid": "YES" if data["ema10_valid"] else "NO",
+                "volume": str(data.get("volume", 0)),
+                "volume_ratio": str(data.get("volume_ratio", 0))
             }
             if data["action"] == "BUY":
                 cache_values["take_profit"] = str(data["take_profit"])
@@ -1033,6 +1133,35 @@ class GoogleSheetIntegration:
             return len(pairs)
         except:
             return "Unknown"
+    
+    def ensure_required_columns_exist(self):
+        """Ensure that Volume (AI) and Volume Ratio (AJ) columns exist with proper headers"""
+        try:
+            # Get first row (headers)
+            headers = self.worksheet.row_values(1)
+            
+            # Volume sütunu (AI = 35)
+            if len(headers) < 35 or not headers[34]:  # headers[34] = AI sütunu
+                self.worksheet.update_cell(1, 35, "Volume")
+                logger.info("Added 'Volume' header to column AI (35)")
+            elif headers[34] != "Volume":
+                # Sütunda değer var ama başlık farklı
+                logger.info(f"Column AI has header '{headers[34]}', updating to 'Volume'")
+                self.worksheet.update_cell(1, 35, "Volume")
+            
+            # Volume Ratio sütunu (AJ = 36)  
+            if len(headers) < 36 or not headers[35]:  # headers[35] = AJ sütunu
+                self.worksheet.update_cell(1, 36, "Volume Ratio")
+                logger.info("Added 'Volume Ratio' header to column AJ (36)")
+            elif headers[35] != "Volume Ratio":
+                # Sütunda değer var ama başlık farklı
+                logger.info(f"Column AJ has header '{headers[35]}', updating to 'Volume Ratio'")
+                self.worksheet.update_cell(1, 36, "Volume Ratio")
+                
+            logger.info("Volume columns headers verified/added successfully")
+            
+        except Exception as e:
+            logger.error(f"Error ensuring required columns exist: {str(e)}")
             
     def has_open_position(self, symbol):
         """
@@ -1237,6 +1366,26 @@ class TelegramNotifier:
         message += f"• Price: {data['last_price']:.8f}\n"
         message += f"• RSI: {data['rsi']:.2f}\n"
         
+        # Volume bilgilerini ekle - Volume ratio'ya göre emoji ekle
+        if "volume_ratio" in data:
+            volume_ratio = data["volume_ratio"]
+            if volume_ratio >= 3.0:
+                volume_emoji = "🚀🚀🚀🚀"
+            elif volume_ratio >= 2.0:
+                volume_emoji = "🚀🚀🚀"
+            elif volume_ratio >= 1.5:
+                volume_emoji = "🔥🔥"
+            elif volume_ratio > 0:
+                volume_emoji = "📈"
+            else:
+                volume_emoji = "⚠️"  # 0 veya boş değer için uyarı
+            
+            message += f"• Volume Ratio: {volume_ratio:.4f}x {volume_emoji}\n"
+            
+        # Raw volume da göster (debug için)
+        if "volume" in data:
+            message += f"• Raw Volume: {data['volume']:.2f}\n"
+        
         # ATR tabanlı TP/SL detayları
         message += f"• Take Profit: {data['take_profit']:.8f}\n"
         message += f"• Stop Loss: {data['stop_loss']:.8f}\n"
@@ -1290,9 +1439,14 @@ class TelegramNotifier:
         # Group by action
         buy_signals = []
         watch_signals = []
+        high_volume_signals = []  # Yüksek hacimli coinler için yeni grup
         other_signals = []
         
         for pair in analyzed_pairs:
+            # Yüksek hacimli coinleri tespit et (volume_ratio >= 1.5)
+            if "volume_ratio" in pair and pair["volume_ratio"] >= 1.5:
+                high_volume_signals.append(pair)
+                
             if pair["action"] == "BUY":
                 buy_signals.append(pair)
             elif pair["rsi"] < 45:  # Close to buy zone
@@ -1305,7 +1459,18 @@ class TelegramNotifier:
             message += "🔥 *BUY Signals:*\n"
             for signal in buy_signals:
                 symbol = signal.get("original_symbol", signal["symbol"])
-                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}\n"
+                vol_info = ""
+                if "volume_ratio" in signal and signal["volume_ratio"] >= 1.5:
+                    vol_info = f", Vol: {signal['volume_ratio']:.1f}x 🔥"
+                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}{vol_info}\n"
+            message += "\n"
+        
+        # Add HIGH VOLUME section
+        if high_volume_signals:
+            message += "📊 *High Volume Coins:*\n"
+            for signal in high_volume_signals:
+                symbol = signal.get("original_symbol", signal["symbol"])
+                message += f"• {symbol} - Vol: {signal['volume_ratio']:.1f}x, RSI: {signal['rsi']:.1f}\n"
             message += "\n"
         
         # Add WATCH signals section
@@ -1313,12 +1478,16 @@ class TelegramNotifier:
             message += "👀 *Watch List:*\n"
             for signal in watch_signals:
                 symbol = signal.get("original_symbol", signal["symbol"])
-                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}\n"
+                vol_info = ""
+                if "volume_ratio" in signal and signal["volume_ratio"] >= 1.0:
+                    vol_info = f", Vol: {signal['volume_ratio']:.1f}x"
+                message += f"• {symbol} - RSI: {signal['rsi']:.1f}, Price: {signal['last_price']:.8f}{vol_info}\n"
             message += "\n"
         
         # Add summary statistic at the end
         message += f"Total Coins Tracked: {len(analyzed_pairs)}\n"
         message += f"BUY Signals: {len(buy_signals)}\n"
+        message += f"High Volume Coins: {len(high_volume_signals)}\n"
         message += f"WATCH List: {len(watch_signals)}\n"
         message += f"Others: {len(other_signals)}"
         
@@ -1400,6 +1569,18 @@ class TradingBot:
                     # BUY sinyalini WAIT olarak değiştir
                     analysis["action"] = "WAIT"
                     analysis["buy_signal"] = False
+                    
+                    # Telegram bildirimi gönderme (açık pozisyon nedeniyle)
+                    try:
+                        self.telegram.send_message(
+                            f"⚠️ *BUY Signal Blocked*\n\n"
+                            f"Symbol: {symbol}\n"
+                            f"Reason: Open position exists\n"
+                            f"RSI: {analysis['rsi']:.2f}\n"
+                            f"Price: {analysis['last_price']:.8f}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending open position warning: {str(e)}")
             
             # Determine whether to update the sheet based on conditions
             should_update = False
@@ -1514,6 +1695,26 @@ class TradingBot:
         message = f"*{display_symbol}*\n"
         message += f"Price: `{analysis['last_price']:.8f}`\n"
         message += f"RSI ({rsi:.1f}): {rsi_status}\n"
+        
+        # Volume bilgilerini ekle - Volume ratio'ya göre emoji ekle
+        if "volume_ratio" in analysis:
+            volume_ratio = analysis["volume_ratio"]
+            if volume_ratio >= 3.0:
+                volume_emoji = "🚀🚀🚀🚀"
+            elif volume_ratio >= 2.0:
+                volume_emoji = "🚀🚀🚀"
+            elif volume_ratio >= 1.5:
+                volume_emoji = "🔥🔥"
+            elif volume_ratio > 0:
+                volume_emoji = "📈"
+            else:
+                volume_emoji = "⚠️"  # 0 veya boş değer için uyarı
+            
+            message += f"Volume Ratio: `{volume_ratio:.4f}x` {volume_emoji}\n"
+            
+        # Raw volume da göster (debug için)
+        if "volume" in analysis:
+            message += f"Raw Volume: `{analysis['volume']:.2f}`\n"
         
         # Technical conditions
         techs = []
