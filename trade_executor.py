@@ -305,7 +305,7 @@ class TelegramNotifier:
     async def send_message_async(self, message):
         if not self.bot or not self.chat_id:
             logger.warning("Telegram bot not configured, skipping notification")
-            return
+            return False
             
         try:
             # Configure connection pool
@@ -313,37 +313,58 @@ class TelegramNotifier:
             async with aiohttp.ClientSession(connector=connector) as session:
                 self.bot._session = session
                 await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='HTML')
-                logger.info(f"Telegram message sent successfully: {message}")
+                logger.debug(f"Telegram message sent successfully: {message[:50]}...")
+                return True
         except Exception as e:
-            logger.error(f"Failed to send Telegram message: {str(e)}")
-            logger.error(f"Bot token: {self.bot_token[:5]}...")
+            logger.error(f"Failed to send Telegram message async: {str(e)}")
+            if hasattr(self, 'bot_token') and self.bot_token:
+                logger.error(f"Bot token: {self.bot_token[:5]}...")
             logger.error(f"Chat ID: {self.chat_id}")
+            return False
     
     def send_message(self, message):
         if not self.bot or not self.chat_id:
             logger.warning("Telegram bot not configured, skipping notification")
-            return
+            return False
         
         # Filter out rate limit and API error messages to avoid spam
         if any(keyword in message.lower() for keyword in ['rate limit', 'quota exceeded', 'api error', '429', 'too many requests']):
             logger.info("Skipping Telegram notification for rate limit/API error message")
-            return
+            return True  # Return True for filtered messages
             
         try:
+            # Check if we have a running event loop
+            try:
+                current_loop = asyncio.get_running_loop()
+                # If we're already in a loop, create a task
+                if current_loop:
+                    # Use asyncio.run_coroutine_threadsafe for thread safety
+                    import concurrent.futures
+                    future = asyncio.run_coroutine_threadsafe(self.send_message_async(message), current_loop)
+                    result = future.result(timeout=10)  # 10 second timeout
+                    return result
+            except RuntimeError:
+                # No running loop, proceed with our own loop
+                pass
+            
             if self.loop and not self.loop.is_closed():
-                self.loop.run_until_complete(self.send_message_async(message))
+                result = self.loop.run_until_complete(self.send_message_async(message))
             else:
                 # Create new loop if current one is closed
                 self.loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self.loop)
-                self.loop.run_until_complete(self.send_message_async(message))
+                result = self.loop.run_until_complete(self.send_message_async(message))
+            
+            if result:
+                logger.info(f"✅ Telegram message sent successfully")
+                return True
+            else:
+                logger.error(f"❌ Telegram message sending returned False")
+                return False
+            
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {str(e)}")
-            # Don't log sensitive information in production
-        finally:
-            # Don't close the loop, just clean up
-            if self.loop and self.loop.is_running():
-                self.loop.stop()
+            return False
 
 class CryptoExchangeAPI:
     """Class to handle Crypto.com Exchange API requests using the approaches from sui_trading_script"""
@@ -1117,11 +1138,11 @@ class GoogleSheetTradeManager:
             except Exception:
             # Create archive worksheet if it doesn't exist
                 logger.info(f"Creating new archive worksheet: {self.archive_worksheet_name}")
-            self.archive_worksheet = self.sheet.add_worksheet(
-                title=self.archive_worksheet_name,
-                rows=1000,
+                self.archive_worksheet = self.sheet.add_worksheet(
+                    title=self.archive_worksheet_name,
+                    rows=1000,
                     cols=25
-            )
+                )
                 self._setup_archive_headers()
         except Exception as e:
             logger.error(f"Error initializing archive worksheet: {str(e)}")
@@ -1468,12 +1489,17 @@ class GoogleSheetTradeManager:
                 tradable_value = row.get('Tradable', 'YES').upper()
                 tradable = tradable_value in ['YES', 'Y', 'TRUE', '1']
                 
-                # Skip if not active or not tradable
-                if not is_active or not tradable:
-                    continue
-                
+                # Get symbol first before logging
                 symbol = row.get('Coin', '')
                 if not symbol:
+                    continue
+                
+                # Enhanced logging for signal detection
+                logger.debug(f"Row {idx+2}: {symbol} - TRADE: {trade_value}, Buy Signal: {buy_signal}, Tradable: {tradable_value}")
+                
+                # Skip if not active or not tradable
+                if not is_active or not tradable:
+                    logger.debug(f"Skipping {symbol}: not active ({is_active}) or not tradable ({tradable})")
                     continue
                     
                 # Format for API: append _USDT if not already in pair format
@@ -1485,6 +1511,7 @@ class GoogleSheetTradeManager:
                     formatted_pair = symbol
                 
                 # Process based on signal type (BUY or SELL)
+                logger.debug(f"Processing signal for {symbol}: action = {buy_signal}")
                 if buy_signal == 'BUY':
                     # Get additional data for trade - handle European number format (comma as decimal separator)
                     try:
@@ -2108,10 +2135,10 @@ class GoogleSheetTradeManager:
                     take_profit=take_profit
                 )
                 
-                # IMMEDIATELY update Buy Signal to WAIT and Tradable to NO after successful buy
-                logger.info(f"Immediately updating Buy Signal to WAIT and Tradable to NO for {symbol}")
+                # IMMEDIATELY update Buy Signal to WAIT and keep Tradable as YES for future signals
+                logger.info(f"Immediately updating Buy Signal to WAIT and keeping Tradable as YES for {symbol}")
                 self.local_manager.add_cell_update(row_index, 'Buy Signal', "WAIT")
-                self.local_manager.add_cell_update(row_index, 'Tradable', "NO")
+                self.local_manager.add_cell_update(row_index, 'Tradable', "YES")
                 
                 # Add to active positions
                 self.active_positions[symbol] = {
@@ -2124,6 +2151,18 @@ class GoogleSheetTradeManager:
                     'highest_price': price,  # Trailing stop için en yüksek fiyatı takip etmek üzere
                     'status': 'ORDER_PLACED'
                 }
+                
+                # Send initial Telegram notification with estimated values
+                self.send_consistent_telegram_message(
+                    action="BUY",
+                    symbol=symbol,
+                    order_id=order_id,
+                    price=price,
+                    quantity=estimated_quantity,
+                    tp=take_profit,
+                    sl=stop_loss,
+                    status="PLACED"
+                )
                 
                 # ÖNEMLİ DEĞİŞİKLİK: Önce alım emrinin filled olmasını bekle
                 # Sonra gerçek miktarı kullanarak TP/SL emirlerini oluştur
@@ -2138,6 +2177,23 @@ class GoogleSheetTradeManager:
                     sl_order_id = None
 
                     logger.info(f"BUY order filled! Using actual quantity ({actual_quantity}) for TP/SL orders")
+
+                    # Verify consistency after order is filled
+                    verification = self.verify_trade_consistency(
+                        symbol=symbol,
+                        action="BUY",
+                        order_id=order_id,
+                        expected_price=actual_price,
+                        expected_quantity=actual_quantity
+                    )
+                    
+                    if verification['consistency_issues']:
+                        logger.warning(f"Consistency issues detected for {symbol} BUY order")
+                        for issue in verification['consistency_issues']:
+                            logger.warning(f"  - {issue}")
+                        
+                        # Try to fix sheet consistency issues
+                        self.ensure_sheet_consistency(symbol, "BUY", order_id, actual_price, actual_quantity)
 
                     # Gerçek miktar kullanarak TP/SL emirlerini oluştur
                     tp_order_id, sl_order_id = self.place_tp_sl_orders(
@@ -2165,17 +2221,16 @@ class GoogleSheetTradeManager:
                         except Exception as e:
                             logger.error(f"Error updating Notes with TP/SL orders: {str(e)}")
                         
-                        # Detaylı Telegram mesajı gönder
-                        self.telegram.send_message(
-                            f"🟢 BUY Order Filled!\n"
-                            f"Symbol: {symbol}\n"
-                            f"Entry Price: {actual_price}\n"
-                            f"Quantity: {actual_quantity}\n"
-                            f"TP: {take_profit}\n"
-                            f"SL: {stop_loss}\n"
-                            f"TP Order ID: {tp_order_id or 'N/A'}\n"
-                            f"SL Order ID: {sl_order_id or 'N/A'}\n"
-                            f"Main Order ID: {order_id}"
+                        # Send final Telegram notification with actual values
+                        self.send_consistent_telegram_message(
+                            action="BUY",
+                            symbol=symbol,
+                            order_id=order_id,
+                            price=actual_price,
+                            quantity=actual_quantity,
+                            tp=take_profit,
+                            sl=stop_loss,
+                            status="FILLED"
                         )
                 else:
                     logger.warning(f"BUY order was not filled, cannot place TP/SL orders")
@@ -2325,6 +2380,33 @@ class GoogleSheetTradeManager:
                     quantity=actual_quantity
                 )
                 
+                # Verify consistency after sell order
+                verification = self.verify_trade_consistency(
+                    symbol=symbol,
+                    action="SELL",
+                    order_id=sell_order_id,
+                    expected_price=price,
+                    expected_quantity=actual_quantity
+                )
+                
+                if verification['consistency_issues']:
+                    logger.warning(f"Consistency issues detected for {symbol} SELL order")
+                    for issue in verification['consistency_issues']:
+                        logger.warning(f"  - {issue}")
+                    
+                    # Try to fix sheet consistency issues
+                    self.ensure_sheet_consistency(symbol, "SELL", sell_order_id, price, actual_quantity)
+                
+                # Send consistent Telegram notification
+                self.send_consistent_telegram_message(
+                    action="SELL",
+                    symbol=symbol,
+                    order_id=sell_order_id,
+                    price=price,
+                    quantity=actual_quantity,
+                    status="EXECUTED"
+                )
+                
                 # Start monitoring in background to confirm fill
                 monitor_thread = threading.Thread(
                     target=self.monitor_sell_order,
@@ -2415,6 +2497,9 @@ class GoogleSheetTradeManager:
         
         try:
             while True:
+                # Force process any pending batch updates to ensure we see latest sheet changes
+                self.force_batch_update()
+                
                 # Get and process trade signals
                 signals = self.get_trade_signals()
                 
@@ -2521,7 +2606,7 @@ class GoogleSheetTradeManager:
                             
                     self.last_tp_sl_revision = now
                 
-                # Process batch updates at regular intervals
+                # Process batch updates at regular intervals (increased frequency for better consistency)
                 current_time = time.time()
                 if current_time - self.last_batch_update > self.batch_update_interval:
                     logger.info("Processing batch updates to Google Sheets...")
@@ -2533,13 +2618,20 @@ class GoogleSheetTradeManager:
                         
                         success = self.process_batch_updates()
                         if success:
-                            logger.info("Batch updates completed successfully")
+                            logger.info("✅ Batch updates completed successfully")
                         else:
-                            logger.warning("Some batch updates failed, will retry later")
+                            logger.warning("⚠️ Some batch updates failed, will retry later")
                     else:
                         logger.debug("No pending operations to process")
                     
                     self.last_batch_update = current_time
+                
+                # Force batch update if there are too many pending operations
+                pending_counts = self.local_manager.get_pending_count()
+                total_pending = sum(pending_counts.values())
+                if total_pending > 50:  # Force update if more than 50 pending operations
+                    logger.warning(f"Too many pending operations ({total_pending}), forcing batch update")
+                    self.force_batch_update()
                 
                 # Sleep until next check
                 logger.info(f"Completed trade check cycle, next check in {self.check_interval} seconds")
@@ -2565,7 +2657,7 @@ class GoogleSheetTradeManager:
             
             # Try to get row data safely with rate limit protection
             try:
-            row_data = self.worksheet.row_values(row_index)
+                row_data = self.worksheet.row_values(row_index)
             except gspread.exceptions.APIError as e:
                 if e.response.status_code == 429:
                     logger.warning(f"Rate limit hit while getting row data for archive, using fallback method")
@@ -2645,7 +2737,7 @@ class GoogleSheetTradeManager:
             # Add archive operation to local manager WITH clear operations dependency
             self.local_manager.add_archive_operation(row_index, row_data_dict, columns_to_clear)
             
-            # Add cell updates for main sheet instead of direct updates
+            # Add cell updates for main sheet instead of direct updates - Reset for new signals
             self.local_manager.add_cell_update(row_index, 'Tradable', "YES")
             self.local_manager.add_cell_update(row_index, 'Buy Signal', "WAIT")
             
@@ -2664,7 +2756,7 @@ class GoogleSheetTradeManager:
                         except ValueError:
                             pl_value = "N/A"
                     
-            self.telegram.send_message(
+                    self.telegram.send_message(
                         f"🔄 Trade archived (queued):\n"
                         f"Symbol: {coin_symbol}\n"
                         f"Entry: {entry_price or 'N/A'}\n"
@@ -3065,6 +3157,34 @@ class GoogleSheetTradeManager:
                     )
                     
                     logger.info(f"Executed order details: price={avg_price}, quantity={cumulative_quantity}")
+                    
+                    # Verify consistency after position closure
+                    verification = self.verify_trade_consistency(
+                        symbol=symbol,
+                        action="SELL",
+                        order_id=executed_order_id,
+                        expected_price=avg_price,
+                        expected_quantity=cumulative_quantity
+                    )
+                    
+                    if verification['consistency_issues']:
+                        logger.warning(f"Consistency issues detected for {symbol} position closure")
+                        for issue in verification['consistency_issues']:
+                            logger.warning(f"  - {issue}")
+                        
+                        # Try to fix sheet consistency issues
+                        self.ensure_sheet_consistency(symbol, "SELL", executed_order_id, avg_price, cumulative_quantity)
+                    
+                    # Send consistent Telegram notification
+                    self.send_consistent_telegram_message(
+                        action="SELL",
+                        symbol=symbol,
+                        order_id=executed_order_id,
+                        price=avg_price,
+                        quantity=cumulative_quantity,
+                        status=f"{order_type} EXECUTED"
+                    )
+                    
                 else:
                     logger.warning(f"Order details could not be retrieved, updating with default values")
                     # If details cannot be retrieved, update with default values
@@ -3095,13 +3215,7 @@ class GoogleSheetTradeManager:
             if symbol in self.active_positions:
                 del self.active_positions[symbol]
             
-            # Send Telegram notification
-            self.telegram.send_message(
-                f"{'🟢 Take Profit' if order_type == 'TP' else '🔴 Stop Loss'} Executed:\n"
-                f"Symbol: {symbol}\n"
-                f"Order ID: {executed_order_id}\n"
-                f"Note: This trade was automatically executed on the exchange and detected by the system."
-            )
+            # Note: Telegram notification is now handled by send_consistent_telegram_message above
             
             return True
         except Exception as e:
@@ -3151,7 +3265,7 @@ class GoogleSheetTradeManager:
                                 # Skip archive processing for this batch
                                 success = False
                             else:
-                    success = self._process_archive_batch(batch['archives'])
+                                success = self._process_archive_batch(batch['archives'])
                         except Exception as e:
                             logger.error(f"Error reinitializing archive worksheet: {str(e)}")
                             failed_ids.extend([a['id'] for a in batch['archives']])
@@ -3452,6 +3566,261 @@ class GoogleSheetTradeManager:
             
         except Exception as e:
             logger.error(f"Error in _process_clear_batch: {str(e)}")
+            return False
+
+    def verify_trade_consistency(self, symbol, action, order_id=None, expected_price=None, expected_quantity=None):
+        """
+        Verify that Telegram messages, sheet updates, and actual crypto actions are consistent
+        
+        Args:
+            symbol (str): Trading symbol
+            action (str): BUY or SELL
+            order_id (str): Order ID from exchange
+            expected_price (float): Expected price
+            expected_quantity (float): Expected quantity
+            
+        Returns:
+            dict: Verification results
+        """
+        try:
+            verification_results = {
+                'telegram_sent': False,
+                'sheet_updated': False,
+                'exchange_order_confirmed': False,
+                'consistency_issues': []
+            }
+            
+            # 1. Verify exchange order exists and is correct
+            if order_id:
+                try:
+                    order_detail = self.exchange_api.send_request("private/get-order-detail", {"order_id": order_id})
+                    if order_detail and order_detail.get("code") == 0:
+                        result = order_detail.get("result", {})
+                        actual_price = float(result.get("avg_price", 0))
+                        actual_quantity = float(result.get("cumulative_quantity", 0))
+                        status = result.get("status")
+                        
+                        verification_results['exchange_order_confirmed'] = True
+                        verification_results['actual_price'] = actual_price
+                        verification_results['actual_quantity'] = actual_quantity
+                        verification_results['order_status'] = status
+                        
+                        # Check if actual values match expected values
+                        if expected_price and abs(actual_price - expected_price) > 0.01:
+                            verification_results['consistency_issues'].append(
+                                f"Price mismatch: expected {expected_price}, actual {actual_price}"
+                            )
+                        
+                        if expected_quantity and abs(actual_quantity - expected_quantity) > 0.001:
+                            verification_results['consistency_issues'].append(
+                                f"Quantity mismatch: expected {expected_quantity}, actual {actual_quantity}"
+                            )
+                    else:
+                        verification_results['consistency_issues'].append(
+                            f"Order {order_id} not found or invalid on exchange"
+                        )
+                except Exception as e:
+                    verification_results['consistency_issues'].append(f"Error checking order: {str(e)}")
+            
+            # 2. Verify sheet data is consistent
+            try:
+                # Get current sheet data for this symbol
+                all_records = self.worksheet.get_all_records()
+                for idx, row in enumerate(all_records):
+                    if row.get('Coin', '') == symbol.split('_')[0]:
+                        sheet_price = self.parse_number(row.get('Purchase Price' if action == 'BUY' else 'Sell Price', '0'))
+                        sheet_quantity = self.parse_number(row.get('Quantity' if action == 'BUY' else 'Sell Quantity', '0'))
+                        sheet_order_id = row.get('order_id', '')
+                        
+                        verification_results['sheet_updated'] = True
+                        verification_results['sheet_price'] = sheet_price
+                        verification_results['sheet_quantity'] = sheet_quantity
+                        verification_results['sheet_order_id'] = sheet_order_id
+                        
+                        # Check sheet consistency
+                        if order_id and sheet_order_id != order_id:
+                            verification_results['consistency_issues'].append(
+                                f"Order ID mismatch: sheet has {sheet_order_id}, exchange has {order_id}"
+                            )
+                        
+                        if expected_price and abs(sheet_price - expected_price) > 0.01:
+                            verification_results['consistency_issues'].append(
+                                f"Sheet price mismatch: expected {expected_price}, sheet has {sheet_price}"
+                            )
+                        
+                        if expected_quantity and abs(sheet_quantity - expected_quantity) > 0.001:
+                            verification_results['consistency_issues'].append(
+                                f"Sheet quantity mismatch: expected {expected_quantity}, sheet has {sheet_quantity}"
+                            )
+                        break
+            except Exception as e:
+                verification_results['consistency_issues'].append(f"Error checking sheet: {str(e)}")
+            
+            # 3. Log verification results
+            if verification_results['consistency_issues']:
+                logger.warning(f"Consistency issues found for {symbol} {action}:")
+                for issue in verification_results['consistency_issues']:
+                    logger.warning(f"  - {issue}")
+            else:
+                logger.info(f"✅ All systems consistent for {symbol} {action}")
+            
+            return verification_results
+            
+        except Exception as e:
+            logger.error(f"Error in verify_trade_consistency: {str(e)}")
+            return {'consistency_issues': [f"Verification error: {str(e)}"]}
+
+    def send_consistent_telegram_message(self, action, symbol, order_id, price, quantity, tp=None, sl=None, status="EXECUTED"):
+        """
+        Send a Telegram message with verified data to ensure consistency
+        
+        Args:
+            action (str): BUY or SELL
+            symbol (str): Trading symbol
+            order_id (str): Order ID
+            price (float): Actual price
+            quantity (float): Actual quantity
+            tp (float): Take profit price
+            sl (float): Stop loss price
+            status (str): Order status
+        """
+        try:
+            # Verify data before sending
+            if not order_id or not price or not quantity:
+                logger.error(f"Cannot send Telegram message - missing data: order_id={order_id}, price={price}, quantity={quantity}")
+                return False
+            
+            # Format message based on action
+            if action == "BUY":
+                message = (
+                    f"🟢 BUY Order {status}!\n"
+                    f"Symbol: {symbol}\n"
+                    f"Entry Price: {price:.8f}\n"
+                    f"Quantity: {quantity:.8f}\n"
+                    f"Order ID: {order_id}"
+                )
+                
+                if tp and sl:
+                    message += f"\nTake Profit: {tp:.8f}\nStop Loss: {sl:.8f}"
+                    
+            elif action == "SELL":
+                message = (
+                    f"🔴 SELL Order {status}!\n"
+                    f"Symbol: {symbol}\n"
+                    f"Exit Price: {price:.8f}\n"
+                    f"Quantity: {quantity:.8f}\n"
+                    f"Order ID: {order_id}"
+                )
+            
+            else:
+                logger.error(f"Invalid action for Telegram message: {action}")
+                return False
+            
+            # Send message
+            success = self.telegram.send_message(message)
+            if success:
+                logger.info(f"✅ Consistent Telegram message sent for {symbol} {action}")
+            else:
+                logger.error(f"❌ Failed to send Telegram message for {symbol} {action}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error sending consistent Telegram message: {str(e)}")
+            return False
+
+    def force_batch_update(self):
+        """
+        Force immediate processing of batch updates for critical operations
+        This ensures sheet updates happen immediately when needed
+        """
+        try:
+            pending_counts = self.local_manager.get_pending_count()
+            total_pending = sum(pending_counts.values())
+            
+            if total_pending == 0:
+                logger.debug("No pending batch updates to force process")
+                return True
+            
+            logger.info(f"Force processing {total_pending} pending batch updates")
+            
+            # Process immediately instead of waiting for interval
+            success = self.process_batch_updates()
+            
+            if success:
+                logger.info("✅ Force batch update completed successfully")
+            else:
+                logger.warning("⚠️ Force batch update had some failures")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error in force_batch_update: {str(e)}")
+            return False
+
+    def ensure_sheet_consistency(self, symbol, action, order_id, price, quantity):
+        """
+        Ensure sheet data is consistent with exchange data
+        This method forces immediate sheet updates if needed
+        """
+        try:
+            logger.info(f"Ensuring sheet consistency for {symbol} {action}")
+            
+            # First, force process any pending batch updates
+            self.force_batch_update()
+            
+            # Then verify consistency
+            verification = self.verify_trade_consistency(
+                symbol=symbol,
+                action=action,
+                order_id=order_id,
+                expected_price=price,
+                expected_quantity=quantity
+            )
+            
+            if verification['consistency_issues']:
+                logger.warning(f"Sheet consistency issues detected for {symbol}")
+                
+                # Try to fix sheet data if possible
+                for issue in verification['consistency_issues']:
+                    logger.warning(f"  - {issue}")
+                    
+                    # If order ID mismatch, update sheet
+                    if "Order ID mismatch" in issue:
+                        logger.info(f"Attempting to fix order ID mismatch for {symbol}")
+                        # Find the row and update order_id
+                        all_records = self.worksheet.get_all_records()
+                        for idx, row in enumerate(all_records):
+                            if row.get('Coin', '') == symbol.split('_')[0]:
+                                row_index = idx + 2  # +2 for header and 1-indexing
+                                self.local_manager.add_cell_update(row_index, 'order_id', order_id)
+                                logger.info(f"Updated order_id for {symbol} in sheet")
+                                break
+                
+                # Force another batch update to apply fixes
+                self.force_batch_update()
+                
+                # Verify again after fixes
+                verification_after = self.verify_trade_consistency(
+                    symbol=symbol,
+                    action=action,
+                    order_id=order_id,
+                    expected_price=price,
+                    expected_quantity=quantity
+                )
+                
+                if not verification_after['consistency_issues']:
+                    logger.info(f"✅ Sheet consistency fixed for {symbol}")
+                else:
+                    logger.warning(f"⚠️ Sheet consistency issues remain for {symbol}")
+                    
+            else:
+                logger.info(f"✅ Sheet consistency verified for {symbol}")
+            
+            return len(verification['consistency_issues']) == 0
+            
+        except Exception as e:
+            logger.error(f"Error in ensure_sheet_consistency: {str(e)}")
             return False
 
 def format_quantity_for_coin(symbol, quantity):

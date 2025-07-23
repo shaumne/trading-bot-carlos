@@ -462,14 +462,12 @@ class TradingViewDataProvider:
         # Count how many MA conditions are valid
         valid_ma_count = sum([data["ma200_valid"], data["ma50_valid"], data["ema10_valid"]])
         
-        # Buy signal (DAHA KATI KOŞULLAR):
-        # 1) RSI < 40 ve en az 2 hareketli ortalama koşulu sağlanırsa AL
-        # 2) VEYA RSI < 30 ve en az 1 hareketli ortalama koşulu sağlanırsa AL
-        # 3) Yeni kriter: RSI < 45 ve en az 1 hareketli ortalama koşulu ve volume_ratio >= 1.5
+        # Buy signal (UPDATED CONDITIONS):
+        # 1) RSI < 30 ve en az 1 hareketli ortalama koşulu sağlanırsa AL (Aşırı satış durumu)
+        # 2) RSI < 40 ve en az 1 hareketli ortalama koşulu ve volume_ratio >= 1.5 (Yüksek hacim kriteri)
         data["buy_signal"] = (
-            (data["rsi"] < 40 and valid_ma_count >= 2) or  # Normal alış durumu
             (data["rsi"] < 30 and valid_ma_count >= 1) or  # Aşırı satış durumu - en az 1 MA koşulu ile
-            (data["rsi"] < 45 and valid_ma_count >= 1 and data.get("volume_ratio", 0) >= 1.5)  # Yeni kriter: Volume 1.5x ve 1 MA
+            (data["rsi"] < 40 and valid_ma_count >= 1 and data.get("volume_ratio", 0) >= 1.5)  # Yüksek hacim kriteri: Volume 1.5x ve 1 MA
         )
         
         # Sell signal: RSI > 70 and price breaks resistance
